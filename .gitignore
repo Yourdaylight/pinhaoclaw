@@ -1,0 +1,29 @@
+# Go binary
+pinhaoclaw
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Node / frontend
+pinhaoclaw-frontend/node_modules/
+pinhaoclaw-frontend/dist/
+pinhaoclaw-frontend/unpackage/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data (runtime)
+~/.pinhaoclaw/
+
+# Env
+.env
+.env.local

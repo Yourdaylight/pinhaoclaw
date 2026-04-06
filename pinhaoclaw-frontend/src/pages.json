@@ -1,0 +1,84 @@
+{
+  "pages": [
+    {
+      "path": "pages/login/index",
+      "style": {
+        "navigationBarTitleText": "拼好虾",
+        "navigationBarBackgroundColor": "#0F0C29",
+        "navigationBarTextStyle": "white",
+        "backgroundColor": "#0F0C29"
+      }
+    },
+    {
+      "path": "pages/panel/index",
+      "style": {
+        "navigationBarTitleText": "我的龙虾",
+        "navigationBarBackgroundColor": "#0F0C29",
+        "navigationBarTextStyle": "white",
+        "backgroundColor": "#0F0C29",
+        "enablePullDownRefresh": true,
+        "backgroundTextStyle": "light"
+      }
+    },
+    {
+      "path": "pages/lobster/bind",
+      "style": {
+        "navigationBarTitleText": "绑定微信",
+        "navigationBarBackgroundColor": "#0F0C29",
+        "navigationBarTextStyle": "white",
+        "backgroundColor": "#0F0C29"
+      }
+    },
+    {
+      "path": "pages/lobster/create",
+      "style": {
+        "navigationBarTitleText": "购买龙虾",
+        "navigationBarBackgroundColor": "#0F0C29",
+        "navigationBarTextStyle": "white",
+        "backgroundColor": "#0F0C29"
+      }
+    },
+    {
+      "path": "pages/admin/index",
+      "style": {
+        "navigationBarTitleText": "管理控制台",
+        "navigationBarBackgroundColor": "#0F0C29",
+        "navigationBarTextStyle": "white",
+        "backgroundColor": "#0a0a1a"
+      }
+    }
+  ],
+  "condition": {
+    "current": 0,
+    "list": [
+      {
+        "name": "登录页",
+        "path": "pages/login/index"
+      }
+    ]
+  },
+  "globalStyle": {
+    "navigationBarTextStyle": "white",
+    "navigationBarTitleText": "拼好虾",
+    "navigationBarBackgroundColor": "#0F0C29",
+    "backgroundColor": "#0F0C29",
+    "app-plus": {
+      "background": "#0F0C29"
+    }
+  },
+  "tabBar": {
+    "custom": false,
+    "color": "#999",
+    "selectedColor": "#FF6B6B",
+    "backgroundColor": "#1a1a2e",
+    "borderStyle": "black",
+    "list": [
+      {
+        "pagePath": "pages/panel/index",
+        "text": "我的龙虾",
+        "iconPath": "static/tab-lobster.png",
+        "selectedIconPath": "static/tab-lobster-active.png"
+      }
+    ]
+  }
+}

@@ -1,0 +1,57 @@
+import { defineStore } from "pinia";
+import { ref, computed } from "vue";
+import { authApi } from "../api/auth";
+
+export const useUserStore = defineStore("user", () => {
+  const token = ref<string>(uni.getStorageSync("pc_user_token") || "");
+  const userId = ref<string>(uni.getStorageSync("pc_user_id") || "");
+  const userName = ref<string>(uni.getStorageSync("pc_user_name") || "");
+  const maxLobsters = ref<number>(Number(uni.getStorageSync("pc_max_lobsters")) || 3);
+  const lobsterCount = ref<number>(0);
+
+  const isLoggedIn = computed(() => !!token.value);
+
+  async function login(inviteCode: string, name?: string) {
+    const res = await authApi.login(inviteCode, name);
+    if (!res.ok) throw new Error(res.message || "登录失败");
+
+    token.value = res.token;
+    userId.value = res.user.id;
+    userName.value = res.user.name;
+    maxLobsters.value = res.user.max_lobsters;
+
+    uni.setStorageSync("pc_user_token", res.token);
+    uni.setStorageSync("pc_user_id", res.user.id);
+    uni.setStorageSync("pc_user_name", res.user.name);
+    uni.setStorageSync("pc_max_lobsters", res.user.max_lobsters);
+  }
+
+  async function fetchMe() {
+    const res = await authApi.me();
+    userName.value = res.user.name;
+    maxLobsters.value = res.user.max_lobsters;
+    lobsterCount.value = res.user.lobster_count;
+    uni.setStorageSync("pc_user_name", res.user.name);
+  }
+
+  function logout() {
+    token.value = "";
+    userId.value = "";
+    userName.value = "";
+    maxLobsters.value = 3;
+    uni.clearStorageSync();
+    uni.reLaunch({ url: "/pages/login/index" });
+  }
+
+  return {
+    token,
+    userId,
+    userName,
+    maxLobsters,
+    lobsterCount,
+    isLoggedIn,
+    login,
+    fetchMe,
+    logout,
+  };
+});
