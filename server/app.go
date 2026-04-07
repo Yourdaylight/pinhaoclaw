@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ type App struct {
 	store   *sharing.Store
 	nodeSvc *claw.NodeService
 	auth    *AdminAuth
+	casdoor *CasdoorClient
 	router  *gin.Engine
 }
 
@@ -33,6 +35,7 @@ func NewApp(cfg *config.Config) *App {
 		store:   store,
 		nodeSvc: claw.NewNodeService(store),
 		auth:    NewAdminAuth(cfg.AdminPassword),
+		casdoor: NewCasdoorClient(cfg),
 	}
 	app.setupRouter()
 
@@ -53,17 +56,17 @@ func NewApp(cfg *config.Config) *App {
 				Name:         "默认节点",
 				Host:         cfg.RemoteHost,
 				SSHPort:      cfg.RemoteSSHPort,
-			SSHUser:      cfg.RemoteUser,
-			SSHKeyPath:   cfg.RemoteKeyPath,
-			SSHPassword:  cfg.RemotePassword,
-			Region:       cfg.RemoteRegion,
-			Status:       "online",
-			MaxLobsters:  10,
-			PicoClawPath: "/usr/local/bin/picoclaw",
-			RemoteHome:   cfg.RemoteHome,
-			CreatedAt:    time.Now().Format("2006-01-02 15:04:05"),
-		}
-		store.SaveNode(node)
+				SSHUser:      cfg.RemoteUser,
+				SSHKeyPath:   cfg.RemoteKeyPath,
+				SSHPassword:  cfg.RemotePassword,
+				Region:       cfg.RemoteRegion,
+				Status:       "online",
+				MaxLobsters:  10,
+				PicoClawPath: "/usr/local/bin/picoclaw",
+				RemoteHome:   cfg.RemoteHome,
+				CreatedAt:    time.Now().Format("2006-01-02 15:04:05"),
+			}
+			store.SaveNode(node)
 		}
 		_ = s
 	}
@@ -83,6 +86,9 @@ func (a *App) setupRouter() {
 	api := r.Group("/api")
 
 	// ── 用户认证 ──
+	api.GET("/auth/config", a.handleAuthConfig)
+	api.GET("/auth/login/casdoor", a.handleCasdoorLogin)
+	api.GET("/auth/callback", a.handleCasdoorCallback)
 	api.POST("/auth/login", a.handleUserLogin)
 	api.GET("/auth/me", a.requireUser(), a.handleMe)
 	api.GET("/regions", a.requireUser(), a.handleListRegions)
@@ -128,27 +134,30 @@ func (a *App) setupRouter() {
 	// 此处仅注册路由占位，实际逻辑在下方 frontendDir 声明后处理
 
 	// ── 静态文件（H5 前端产物）──
-	// uni-app H5 构建产物放在 pinhaoclaw-frontend/dist/build/h5
-	const frontendDir = "pinhaoclaw-frontend/dist/build/h5"
+	frontendDir := a.cfg.FrontendDir
+	frontendIndex := frontendDir + "/index.html"
 	r.Static("/assets", frontendDir+"/assets")
 	r.StaticFile("/favicon.ico", frontendDir+"/favicon.ico")
+
+	serveFrontendIndex := func(c *gin.Context) {
+		c.File(frontendIndex)
+	}
 
 	// 管理后台隐藏路径（在此处定义，因为需要 frontendDir）
 	if a.cfg.AdminPath != "" {
 		adminPath := strings.TrimPrefix(a.cfg.AdminPath, "/")
-		r.GET("/"+adminPath, func(c *gin.Context) {
-			c.File(frontendDir + "/index.html")
-		})
-		r.GET("/"+adminPath+"/*filepath", func(c *gin.Context) {
-			c.File(frontendDir + "/index.html")
-		})
+		r.GET("/"+adminPath, serveFrontendIndex)
+		r.GET("/"+adminPath+"/*filepath", serveFrontendIndex)
 	}
 
 	r.NoRoute(func(c *gin.Context) {
-		// 所有未匹配路由返回 index.html（SPA 路由支持）
-		if !strings.HasPrefix(c.Request.URL.Path, "/api") &&
-			!strings.HasPrefix(c.Request.URL.Path, "/ws") {
-			c.File(frontendDir + "/index.html")
+		if shouldBlockFrontendFallback(c.Request.URL.Path) {
+			c.JSON(404, gin.H{"error": "not found"})
+			return
+		}
+		// 所有未匹配前端路由回退到 index.html（SPA 路由支持）
+		if !strings.HasPrefix(c.Request.URL.Path, "/api") && !strings.HasPrefix(c.Request.URL.Path, "/ws") {
+			serveFrontendIndex(c)
 			return
 		}
 		c.JSON(404, gin.H{"error": "not found"})
@@ -178,7 +187,7 @@ func (a *App) requireUser() gin.HandlerFunc {
 				return
 			}
 		}
-		c.JSON(401, gin.H{"error": "登录已过期，请重新输入邀请码"})
+		c.JSON(401, gin.H{"error": "登录已过期，请重新登录"})
 		c.Abort()
 	}
 }
@@ -191,6 +200,11 @@ func getUser(c *gin.Context) *sharing.User {
 // ── 用户认证 Handler ──────────────────────────────────
 
 func (a *App) handleUserLogin(c *gin.Context) {
+	if a.cfg.CasdoorEnabled() {
+		c.JSON(400, gin.H{"ok": false, "message": "当前已启用 Casdoor 统一认证，请从统一登录入口进入"})
+		return
+	}
+
 	var req struct {
 		InviteCode string `json:"invite_code"`
 		Name       string `json:"name"`
@@ -252,8 +266,14 @@ func (a *App) handleMe(c *gin.Context) {
 	lobsters := a.store.GetLobstersByUser(u.ID)
 	c.JSON(200, gin.H{
 		"user": gin.H{
-			"id": u.ID, "name": u.Name, "max_lobsters": u.MaxLobsters,
-			"created_at": u.CreatedAt, "lobster_count": len(lobsters),
+			"id":            u.ID,
+			"name":          u.Name,
+			"max_lobsters":  u.MaxLobsters,
+			"created_at":    u.CreatedAt,
+			"lobster_count": len(lobsters),
+			"auth_source":   u.AuthSource,
+			"organization":  u.CasdoorOrganization,
+			"email":         u.Email,
 		},
 	})
 }
@@ -532,7 +552,9 @@ func (a *App) handleDeleteLobster(c *gin.Context) {
 // ── 管理员 Handler ────────────────────────────────────
 
 func (a *App) handleAdminLogin(c *gin.Context) {
-	var req struct{ Password string `json:"password"` }
+	var req struct {
+		Password string `json:"password"`
+	}
 	c.BindJSON(&req)
 	token, ok := a.auth.Login(req.Password)
 	if !ok {
@@ -560,7 +582,7 @@ func (a *App) handleAdminGate(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{
-		"ok":       true,
+		"ok":                true,
 		"requires_password": a.cfg.AdminPassword != "",
 	})
 }
@@ -578,10 +600,10 @@ func (a *App) handleAdminOverview(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"total_users":     len(users),
-		"total_lobsters":  len(lobsters),
+		"total_users":      len(users),
+		"total_lobsters":   len(lobsters),
 		"running_lobsters": running,
-		"total_nodes":     len(nodes),
+		"total_nodes":      len(nodes),
 	})
 }
 
@@ -734,13 +756,19 @@ func (a *App) handleUpdateSettings(c *gin.Context) {
 	c.BindJSON(&updates)
 	s := a.store.ReadSettings()
 	if v, ok := updates["default_monthly_token_limit"]; ok {
-		if f, ok := v.(float64); ok { s.DefaultMonthlyTokenLimit = int64(f) }
+		if f, ok := v.(float64); ok {
+			s.DefaultMonthlyTokenLimit = int64(f)
+		}
 	}
 	if v, ok := updates["default_monthly_space_limit_mb"]; ok {
-		if f, ok := v.(float64); ok { s.DefaultMonthlySpaceLimitMB = int64(f) }
+		if f, ok := v.(float64); ok {
+			s.DefaultMonthlySpaceLimitMB = int64(f)
+		}
 	}
 	if v, ok := updates["default_max_lobsters_per_user"]; ok {
-		if f, ok := v.(float64); ok { s.DefaultMaxLobstersPerUser = int(f) }
+		if f, ok := v.(float64); ok {
+			s.DefaultMaxLobstersPerUser = int(f)
+		}
 	}
 	a.store.WriteSettings(s)
 	c.JSON(200, s)
@@ -779,6 +807,44 @@ func stripAnsi(s string) string {
 		result.WriteRune(r)
 	}
 	return result.String()
+}
+
+func shouldBlockFrontendFallback(requestPath string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(requestPath))
+	if normalized == "" {
+		return false
+	}
+	if strings.Contains(normalized, "..") {
+		return true
+	}
+	sensitivePrefixes := []string{
+		"/scripts",
+		"/.git",
+		"/.env",
+		"/config",
+		"/server",
+		"/claw",
+		"/sharing",
+	}
+	for _, prefix := range sensitivePrefixes {
+		if normalized == prefix || strings.HasPrefix(normalized, prefix+"/") {
+			return true
+		}
+	}
+	sensitiveExts := map[string]struct{}{
+		".sh":   {},
+		".env":  {},
+		".go":   {},
+		".mod":  {},
+		".sum":  {},
+		".pem":  {},
+		".key":  {},
+		".md":   {},
+		".yaml": {},
+		".yml":  {},
+	}
+	_, blocked := sensitiveExts[path.Ext(normalized)]
+	return blocked
 }
 
 func (a *App) handleQRCode(c *gin.Context) {

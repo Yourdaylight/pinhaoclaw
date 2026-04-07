@@ -52,13 +52,19 @@ func (s *Store) writeJSON(filename string, val any) error {
 // ── User ──────────────────────────────────────────────
 
 type User struct {
-	ID          string `json:"id"`           // 邀请码即为 ID
-	Name        string `json:"name"`         // 昵称
-	InviteCode  string `json:"invite_code"`  // 登录凭证
-	CreatedAt   string `json:"created_at"`
-	LastLoginAt string `json:"last_login_at"`
-	MaxLobsters int    `json:"max_lobsters"` // 最大龙虾数（默认 3）
-	SessionToken string `json:"session_token,omitempty"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	InviteCode          string `json:"invite_code,omitempty"`
+	CreatedAt           string `json:"created_at"`
+	LastLoginAt         string `json:"last_login_at"`
+	MaxLobsters         int    `json:"max_lobsters"`
+	SessionToken        string `json:"session_token,omitempty"`
+	AuthSource          string `json:"auth_source,omitempty"`
+	CasdoorSub          string `json:"casdoor_sub,omitempty"`
+	CasdoorUsername     string `json:"casdoor_username,omitempty"`
+	CasdoorOrganization string `json:"casdoor_organization,omitempty"`
+	Email               string `json:"email,omitempty"`
+	Avatar              string `json:"avatar,omitempty"`
 }
 
 func (s *Store) ReadUsers() (map[string]*User, error) {
@@ -88,6 +94,16 @@ func (s *Store) GetUserByInviteCode(code string) *User {
 func (s *Store) GetUser(id string) *User {
 	users, _ := s.ReadUsers()
 	return users[id]
+}
+
+func (s *Store) GetUserByCasdoorSub(sub string) *User {
+	users, _ := s.ReadUsers()
+	for _, u := range users {
+		if u.CasdoorSub == sub {
+			return u
+		}
+	}
+	return nil
 }
 
 // ── Lobster（龙虾 = 隔离的 picoclaw 实例） ──────────

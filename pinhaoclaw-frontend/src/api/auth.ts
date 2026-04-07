@@ -18,10 +18,24 @@ export interface MeResponse {
     max_lobsters: number;
     created_at: string;
     lobster_count: number;
+    auth_source?: string;
+    organization?: string;
+    email?: string;
   };
 }
 
+export interface AuthConfigResponse {
+  mode: "invite" | "casdoor";
+  casdoor_enabled: boolean;
+  organization?: string;
+  application?: string;
+  login_url?: string;
+  register_hint?: string;
+}
+
 export const authApi = {
+  config: () => http.get<AuthConfigResponse>("/api/auth/config"),
+
   login: (inviteCode: string, name?: string) =>
     http.post<LoginResponse>("/api/auth/login", { invite_code: inviteCode, name }),
 

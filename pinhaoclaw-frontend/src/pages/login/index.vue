@@ -11,7 +11,45 @@
           </div>
         </template>
 
-        <el-form @submit.prevent="doLogin" label-position="top">
+        <div v-if="authMode === 'casdoor'" class="casdoor-mode">
+          <el-alert
+            title="已启用 Casdoor 统一认证"
+            type="success"
+            show-icon
+            :closable="false"
+          />
+
+          <div class="casdoor-copy">
+            <p>登录与注册都由统一授权中心处理。</p>
+            <p>
+              新用户会直接注册到
+              <strong>{{ authConfig.organization || 'JQ' }}</strong>
+              组织下。
+            </p>
+            <p class="hint">{{ authConfig.register_hint || '在统一认证页点击注册即可完成开户。' }}</p>
+          </div>
+
+          <el-button
+            type="primary"
+            size="large"
+            class="login-btn"
+            :loading="loading"
+            @click="goCasdoorLogin"
+          >
+            前往统一认证中心
+          </el-button>
+
+          <el-alert
+            v-if="errorMsg"
+            :title="errorMsg"
+            type="error"
+            show-icon
+            :closable="false"
+            style="margin-top: 12px"
+          />
+        </div>
+
+        <el-form v-else @submit.prevent="doLogin" label-position="top">
           <el-form-item label="邀请码">
             <el-input
               v-model="inviteCode"
@@ -45,8 +83,6 @@
             style="margin-top: 8px"
           />
         </el-form>
-
-
       </el-card>
     </div>
   </div>
@@ -63,24 +99,31 @@
       </view>
 
       <view class="card">
-        <text class="card-title">输入邀请码</text>
-        <input
-          class="invite-input"
-          v-model="inviteCode"
-          placeholder="请输入邀请码"
-          placeholder-class="input-placeholder"
-          maxlength="20"
-          @confirm="doLogin"
-        />
-        <button
-          class="login-btn"
-          :class="{ disabled: loading }"
-          :disabled="loading"
-          @click="doLogin"
-        >
-          {{ loading ? "验证中..." : "进入龙虾窝" }}
-        </button>
-        <text v-if="errorMsg" class="error-msg">{{ errorMsg }}</text>
+        <template v-if="authMode === 'casdoor'">
+          <text class="card-title">已启用统一认证</text>
+          <text class="casdoor-tip">当前 Casdoor 登录流程优先支持 H5 浏览器访问，请使用部署后的 Web 地址登录或注册。</text>
+          <text class="casdoor-tip minor">注册完成后用户会自动进入 {{ authConfig.organization || 'JQ' }} 组织。</text>
+        </template>
+        <template v-else>
+          <text class="card-title">输入邀请码</text>
+          <input
+            class="invite-input"
+            v-model="inviteCode"
+            placeholder="请输入邀请码"
+            placeholder-class="input-placeholder"
+            maxlength="20"
+            @confirm="doLogin"
+          />
+          <button
+            class="login-btn"
+            :class="{ disabled: loading }"
+            :disabled="loading"
+            @click="doLogin"
+          >
+            {{ loading ? "验证中..." : "进入龙虾窝" }}
+          </button>
+          <text v-if="errorMsg" class="error-msg">{{ errorMsg }}</text>
+        </template>
       </view>
     </view>
   </view>
@@ -90,6 +133,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { useUserStore } from "../../stores/user";
+import { authApi, type AuthConfigResponse } from "../../api/auth";
 // #ifdef H5
 import { Key } from "@element-plus/icons-vue";
 const KeyIcon = Key;
@@ -99,23 +143,52 @@ const userStore = useUserStore();
 const inviteCode = ref("");
 const loading = ref(false);
 const errorMsg = ref("");
+const authMode = ref<"invite" | "casdoor">("invite");
+const authConfig = ref<AuthConfigResponse>({
+  mode: "invite",
+  casdoor_enabled: false,
+});
 
-onMounted(() => {
+onMounted(async () => {
   if (userStore.isLoggedIn) {
     uni.reLaunch({ url: "/pages/panel/index" });
     return;
   }
+
+  try {
+    const cfg = await authApi.config();
+    authConfig.value = cfg;
+    authMode.value = cfg.mode || "invite";
+  } catch {
+    authMode.value = "invite";
+  }
+
   // #ifdef H5
-  const search = window.location.search;
-  const params = new URLSearchParams(
-    search.replace("#/", "").replace(/^.*\?/, "?")
-  );
-  const code = params.get("code");
-  if (code) inviteCode.value = code;
+  if (authMode.value !== "casdoor") {
+    const search = window.location.search;
+    const params = new URLSearchParams(
+      search.replace("#/", "").replace(/^.*\?/, "?")
+    );
+    const code = params.get("code");
+    if (code) inviteCode.value = code;
+  }
   // #endif
 });
 
+function goCasdoorLogin() {
+  loading.value = true;
+  errorMsg.value = "";
+  // #ifdef H5
+  window.location.href = authConfig.value.login_url || "/api/auth/login/casdoor";
+  // #endif
+}
+
 async function doLogin() {
+  if (authMode.value === "casdoor") {
+    goCasdoorLogin();
+    return;
+  }
+
   const code = inviteCode.value.trim();
   if (!code) {
     errorMsg.value = "请输入邀请码";
@@ -137,7 +210,6 @@ async function doLogin() {
       loading.value = false;
     });
 }
-
 </script>
 
 <style scoped>
@@ -181,12 +253,28 @@ async function doLogin() {
   margin: 0;
 }
 
-.login-btn {
-  width: 100%;
+.casdoor-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
-.card-footer {
-  text-align: center;
+.casdoor-copy {
+  color: #606266;
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.casdoor-copy p {
+  margin: 0;
+}
+
+.casdoor-copy .hint {
+  color: #909399;
+}
+
+.login-btn {
+  width: 100%;
 }
 /* #endif */
 
@@ -267,6 +355,18 @@ async function doLogin() {
   color: rgba(255, 255, 255, 0.8);
   text-align: center;
   margin-bottom: 8rpx;
+}
+
+.casdoor-tip {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 26rpx;
+  line-height: 1.8;
+  text-align: center;
+}
+
+.casdoor-tip.minor {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 24rpx;
 }
 
 .invite-input {

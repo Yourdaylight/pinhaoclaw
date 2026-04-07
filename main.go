@@ -22,19 +22,31 @@ func main() {
 		return
 	}
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("加载启动配置失败: %v", err)
+	}
 
 	// 如果未配置 AdminPath，自动生成随机路径
 	if cfg.AdminPath == "" {
 		cfg.AdminPath = "/mgr-" + randomSuffix(8)
 		log.Printf("[PinHaoClaw] 📋 自动生成管理后台路径: %s", cfg.AdminPath)
 	}
+	if err := cfg.PrepareForStart(); err != nil {
+		log.Fatalf("启动前检查失败: %v", err)
+	}
 
 	log.Printf("[PinHaoClaw] 🦞 启动中...")
 	log.Printf("  监听地址: http://%s:%d", *host, *port)
+	log.Printf("  数据目录: %s", cfg.ShareClawHome)
+	log.Printf("  前端目录: %s", cfg.FrontendDir)
+	log.Printf("  认证模式: %s", cfg.AuthMode)
+	if cfg.CasdoorEnabled() {
+		log.Printf("[PinHaoClaw] 🔐 Casdoor 已启用: endpoint=%s app=%s redirect=%s", cfg.CasdoorEndpoint, cfg.CasdoorApplication, cfg.CasdoorRedirectURL())
+	}
 
 	if cfg.AdminPassword == "" {
-		log.Printf("[PinHaoClaw] ⚠️  未设置 PINHAOCLAW_ADMIN_PASSWORD，管理后台将无密码保护！")
+		log.Printf("[PinHaoClaw] ⚠️  未设置 PINHAOCLAW_ADMIN_PASSWORD，管理后台登录已禁用")
 	} else {
 		log.Printf("[PinHaoClaw] 🔐 管理后台入口: http://%s:%d%s", *host, *port, cfg.AdminPath)
 	}
@@ -63,6 +75,8 @@ func envInt(key string, defaultVal int) int {
 		return defaultVal
 	}
 	var n int
-	fmt.Sscanf(v, "%d", &n)
+	if _, err := fmt.Sscanf(v, "%d", &n); err != nil || n <= 0 {
+		return defaultVal
+	}
 	return n
 }
