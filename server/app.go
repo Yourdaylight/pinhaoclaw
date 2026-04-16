@@ -7,16 +7,18 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	qrcode "github.com/skip2/go-qrcode"
 
-	"github.com/garden/pinhaoclaw/claw"
-	"github.com/garden/pinhaoclaw/config"
-	"github.com/garden/pinhaoclaw/sharing"
+	"github.com/pinhaoclaw/pinhaoclaw/claw"
+	"github.com/pinhaoclaw/pinhaoclaw/config"
+	"github.com/pinhaoclaw/pinhaoclaw/sharing"
 )
 
 type App struct {
@@ -24,8 +26,11 @@ type App struct {
 	store   *sharing.Store
 	nodeSvc *claw.NodeService
 	auth    *AdminAuth
-	casdoor *CasdoorClient
+	sidecar *SidecarClient
 	router  *gin.Engine
+
+	// userOpMu protects check-and-act operations (lobster creation, invite validation, node count)
+	userOpMu sync.Mutex
 }
 
 func NewApp(cfg *config.Config) *App {
@@ -35,7 +40,7 @@ func NewApp(cfg *config.Config) *App {
 		store:   store,
 		nodeSvc: claw.NewNodeService(store),
 		auth:    NewAdminAuth(cfg.AdminPassword),
-		casdoor: NewCasdoorClient(cfg),
+		sidecar: NewSidecarClient(cfg),
 	}
 	app.setupRouter()
 
@@ -53,6 +58,7 @@ func NewApp(cfg *config.Config) *App {
 		if !found {
 			node := &sharing.Node{
 				ID:           "node_" + shortID(),
+				Type:         "ssh",
 				Name:         "默认节点",
 				Host:         cfg.RemoteHost,
 				SSHPort:      cfg.RemoteSSHPort,
@@ -87,12 +93,19 @@ func (a *App) setupRouter() {
 
 	// ── 用户认证 ──
 	api.GET("/auth/config", a.handleAuthConfig)
-	api.GET("/auth/login/casdoor", a.handleCasdoorLogin)
-	api.GET("/auth/callback", a.handleCasdoorCallback)
 	api.POST("/auth/login", a.handleUserLogin)
 	api.GET("/auth/me", a.requireUser(), a.handleMe)
 	api.GET("/regions", a.requireUser(), a.handleListRegions)
 	api.GET("/qrcode", a.handleQRCode)
+
+	// ── Sidecar 登录代理（浏览器 → pinhaoclaw → sidecar）──
+	if a.cfg.SidecarEnabled() {
+		api.GET("/auth/sidecar/login", a.handleSidecarLogin)
+		api.GET("/auth/sidecar/callback", a.handleSidecarCallback)
+		api.POST("/auth/sidecar/logout", a.requireUser(), a.handleSidecarLogout)
+		api.GET("/auth/sidecar/logout", a.handleSidecarLogoutPage)
+		api.GET("/auth/sidecar/logout-complete", a.handleSidecarLogoutComplete)
+	}
 
 	// ── 用户龙虾操作 ──
 	user := api.Group("/lobsters")
@@ -107,6 +120,15 @@ func (a *App) setupRouter() {
 
 	// ── WebSocket（小程序端使用）──
 	r.GET("/ws/bind/:id", a.handleBindWeixinWS)
+
+	// ── Skill 库（用户浏览） ──
+	api.GET("/skills", a.requireUser(), a.handleListSkills)
+	api.GET("/skills/:slug", a.requireUser(), a.handleGetSkill)
+
+	// ── 龙虾 Skill 管理 ──
+	user.GET("/:id/skills", a.handleListLobsterSkills)
+	user.POST("/:id/skills", a.handleInstallSkill)
+	user.DELETE("/:id/skills/:slug", a.handleUninstallSkill)
 
 	// ── 管理员 ──
 	api.POST("/admin/login", a.handleAdminLogin)
@@ -124,6 +146,12 @@ func (a *App) setupRouter() {
 	admin.DELETE("/invites/:code", a.handleDeleteInvite)
 	admin.GET("/settings", a.handleGetSettings)
 	admin.PUT("/settings", a.handleUpdateSettings)
+
+	// ── 管理员 Skill 库管理 ──
+	admin.GET("/skills", a.handleAdminListSkills)
+	admin.POST("/skills", a.handleAdminCreateSkill)
+	admin.PUT("/skills/:slug", a.handleAdminUpdateSkill)
+	admin.DELETE("/skills/:slug", a.handleAdminDeleteSkill)
 
 	// ── 管理后台隐藏入口验证（无需登录）──
 	// 前端管理页加载时调用，确认当前访问路径匹配 AdminPath 配置
@@ -170,38 +198,77 @@ func (a *App) setupRouter() {
 
 func (a *App) requireUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		token := c.GetHeader("X-User-Token")
-		if token == "" {
-			token = c.Query("token")
-		}
+		token := userTokenFromRequest(c.Request, strings.HasPrefix(c.Request.URL.Path, "/ws/") || strings.HasSuffix(c.Request.URL.Path, "/bind"))
 		if token == "" {
 			c.JSON(401, gin.H{"error": "请先登录"})
 			c.Abort()
 			return
 		}
-		users, _ := a.store.ReadUsers()
-		for _, u := range users {
-			if u.SessionToken == token {
-				c.Set("user", u)
-				c.Next()
-				return
-			}
+
+		u, err := a.authenticateUserToken(token)
+		if err != nil {
+			c.JSON(401, gin.H{"error": "登录已过期，请重新登录"})
+			c.Abort()
+			return
 		}
-		c.JSON(401, gin.H{"error": "登录已过期，请重新登录"})
-		c.Abort()
+		c.Set("user", u)
+		c.Next()
 	}
 }
 
+func userTokenFromRequest(r *http.Request, allowQuery bool) string {
+	token := strings.TrimSpace(r.Header.Get("X-User-Token"))
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("Authorization"))
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("X-Auth-Token"))
+	}
+	if token == "" && allowQuery {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	return token
+}
+
+func (a *App) authenticateUserToken(token string) (*sharing.User, error) {
+	if token == "" {
+		return nil, fmt.Errorf("missing token")
+	}
+
+	if a.cfg.SidecarEnabled() {
+		identity, err := a.sidecar.Verify(token)
+		if err != nil {
+			return nil, err
+		}
+		return a.findOrCreateSidecarUser(identity), nil
+	}
+
+	users, _ := a.store.ReadUsers()
+	for _, u := range users {
+		if u.SessionToken == token {
+			return u, nil
+		}
+	}
+	return nil, fmt.Errorf("session not found")
+}
+
 func getUser(c *gin.Context) *sharing.User {
-	u, _ := c.Get("user")
-	return u.(*sharing.User)
+	u, exists := c.Get("user")
+	if !exists {
+		return nil
+	}
+	user, ok := u.(*sharing.User)
+	if !ok {
+		return nil
+	}
+	return user
 }
 
 // ── 用户认证 Handler ──────────────────────────────────
 
 func (a *App) handleUserLogin(c *gin.Context) {
-	if a.cfg.CasdoorEnabled() {
-		c.JSON(400, gin.H{"ok": false, "message": "当前已启用 Casdoor 统一认证，请从统一登录入口进入"})
+	if a.cfg.SidecarEnabled() {
+		c.JSON(400, gin.H{"ok": false, "message": "当前已启用统一认证，请从统一登录入口进入"})
 		return
 	}
 
@@ -209,7 +276,10 @@ func (a *App) handleUserLogin(c *gin.Context) {
 		InviteCode string `json:"invite_code"`
 		Name       string `json:"name"`
 	}
-	c.BindJSON(&req)
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的请求"})
+		return
+	}
 	code := strings.TrimSpace(req.InviteCode)
 	if code == "" {
 		c.JSON(400, gin.H{"ok": false, "message": "请输入邀请码"})
@@ -217,8 +287,10 @@ func (a *App) handleUserLogin(c *gin.Context) {
 	}
 
 	// 检查邀请码
+	a.userOpMu.Lock()
 	inv := a.store.GetInvite(code)
 	if inv == nil {
+		a.userOpMu.Unlock()
 		c.JSON(403, gin.H{"ok": false, "message": "邀请码无效"})
 		return
 	}
@@ -228,6 +300,7 @@ func (a *App) handleUserLogin(c *gin.Context) {
 	if user == nil {
 		// 首次使用 → 检查配额并创建用户
 		if inv.MaxUses > 0 && inv.UsedCount >= inv.MaxUses {
+			a.userOpMu.Unlock()
 			c.JSON(403, gin.H{"ok": false, "message": "邀请码已被使用"})
 			return
 		}
@@ -246,6 +319,7 @@ func (a *App) handleUserLogin(c *gin.Context) {
 		inv.UsedBy = append(inv.UsedBy, user.ID)
 		a.store.SaveInvite(inv)
 	}
+	a.userOpMu.Unlock()
 
 	// 生成 session token
 	user.SessionToken = generateToken()
@@ -303,7 +377,9 @@ func (a *App) handleListMyLobsters(c *gin.Context) {
 func (a *App) handleCreateLobster(c *gin.Context) {
 	u := getUser(c)
 
-	// 检查配额
+	// 检查配额（加锁防止并发超配额）
+	a.userOpMu.Lock()
+	defer a.userOpMu.Unlock()
 	count := a.store.CountLobstersByUser(u.ID)
 	if count >= u.MaxLobsters {
 		c.JSON(400, gin.H{"ok": false, "message": fmt.Sprintf("已达龙虾上限(%d只)，请联系虾主升级", u.MaxLobsters)})
@@ -314,7 +390,10 @@ func (a *App) handleCreateLobster(c *gin.Context) {
 		Name   string `json:"name"`
 		Region string `json:"region"` // 区域偏好，空=自动选最空闲
 	}
-	c.BindJSON(&req)
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的请求"})
+		return
+	}
 	if req.Name == "" {
 		req.Name = fmt.Sprintf("龙虾%d号", count+1)
 	}
@@ -409,7 +488,8 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 	a.store.SaveLobster(l)
 
 	writeSSE := func(event, stage, message string) {
-		fmt.Fprintf(c.Writer, "event: %s\ndata: {\"stage\":\"%s\",\"message\":\"%s\"}\n\n", event, stage, message)
+		data, _ := json.Marshal(map[string]string{"stage": stage, "message": message})
+		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, string(data))
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -424,7 +504,7 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 	writeSSE("progress", "start", "正在连接远端节点...")
 
 	// SSH 流式执行 picoclaw auth weixin
-	outCh, errCh := a.nodeSvc.BindWeixin(ctx, node)
+	outCh, errCh := a.nodeSvc.BindWeixin(ctx, node, c.Param("id"))
 
 	var qrSent bool
 	var loginSuccess bool
@@ -488,9 +568,9 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 		l.BoundAt = time.Now().Format("2006-01-02 15:04:05")
 		a.store.SaveLobster(l)
 
-		// 重启 gateway
+		// 重启实例
 		writeSSE("progress", "restart", "正在重启 picoclaw gateway...")
-		_ = a.nodeSvc.RestartGateway(ctx, node)
+		_ = a.nodeSvc.RestartInstance(ctx, node, l)
 
 		writeSSEData("done", `{"stage":"done","message":"微信绑定成功！龙虾已上线 🦞"}`)
 	} else {
@@ -523,7 +603,13 @@ func (a *App) handleStartLobster(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "龙虾不存在"})
 		return
 	}
-	// TODO: 实际重启远端实例
+	node := a.store.GetNode(l.NodeID)
+	if node != nil {
+		if err := a.nodeSvc.StartInstance(c.Request.Context(), node, l.ID, l.Port); err != nil {
+			c.JSON(500, gin.H{"ok": false, "message": "启动实例失败: " + err.Error()})
+			return
+		}
+	}
 	l.Status = "running"
 	a.store.SaveLobster(l)
 	c.JSON(200, gin.H{"ok": true, "message": "龙虾已唤醒 🦞"})
@@ -538,12 +624,14 @@ func (a *App) handleDeleteLobster(c *gin.Context) {
 	}
 	node := a.store.GetNode(l.NodeID)
 	if node != nil {
-		_ = a.nodeSvc.RemoveInstance(context.Background(), node, l.ID)
+		_ = a.nodeSvc.RemoveInstance(context.Background(), node, l.ID, l.Port)
+		a.userOpMu.Lock()
 		node.CurrentCount--
 		if node.CurrentCount < 0 {
 			node.CurrentCount = 0
 		}
 		a.store.SaveNode(node)
+		a.userOpMu.Unlock()
 	}
 	a.store.DeleteLobster(l.ID)
 	c.JSON(200, gin.H{"ok": true, "message": "龙虾已释放 🌊"})
@@ -555,7 +643,10 @@ func (a *App) handleAdminLogin(c *gin.Context) {
 	var req struct {
 		Password string `json:"password"`
 	}
-	c.BindJSON(&req)
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的请求"})
+		return
+	}
 	token, ok := a.auth.Login(req.Password)
 	if !ok {
 		c.JSON(403, gin.H{"ok": false, "message": "密码错误"})
@@ -633,17 +724,32 @@ func (a *App) handleAddNode(c *gin.Context) {
 	}
 	req.ID = "node_" + shortID()
 	req.CreatedAt = time.Now().Format("2006-01-02 15:04:05")
+	if req.Type == "" {
+		req.Type = "ssh"
+	}
 	if req.Status == "" {
 		req.Status = "offline"
 	}
-	if req.SSHPort <= 0 {
-		req.SSHPort = 22
-	}
-	if req.SSHUser == "" {
-		req.SSHUser = "root"
-	}
-	if req.RemoteHome == "" {
-		req.RemoteHome = "/opt/shareclaw"
+	if req.Type == "local" {
+		if strings.TrimSpace(req.Host) == "" {
+			req.Host = "local"
+		}
+		req.SSHPort = 0
+		req.SSHUser = ""
+		req.SSHPassword = ""
+		if strings.TrimSpace(req.RemoteHome) == "" {
+			req.RemoteHome = filepath.Join(a.cfg.ShareClawHome, "local-nodes", req.ID)
+		}
+	} else {
+		if req.SSHPort <= 0 {
+			req.SSHPort = 22
+		}
+		if req.SSHUser == "" {
+			req.SSHUser = "root"
+		}
+		if req.RemoteHome == "" {
+			req.RemoteHome = "/opt/pinhaoclaw"
+		}
 	}
 	if req.MaxLobsters <= 0 {
 		req.MaxLobsters = 10
@@ -713,7 +819,10 @@ func (a *App) handleCreateInvite(c *gin.Context) {
 		CreatedBy string `json:"created_by"`
 		MaxUses   int    `json:"max_uses"`
 	}
-	c.BindJSON(&req)
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的请求"})
+		return
+	}
 	if req.CreatedBy == "" {
 		req.CreatedBy = "虾主"
 	}
@@ -753,7 +862,10 @@ func (a *App) handleGetSettings(c *gin.Context) {
 
 func (a *App) handleUpdateSettings(c *gin.Context) {
 	var updates map[string]any
-	c.BindJSON(&updates)
+	if err := c.BindJSON(&updates); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的请求"})
+		return
+	}
 	s := a.store.ReadSettings()
 	if v, ok := updates["default_monthly_token_limit"]; ok {
 		if f, ok := v.(float64); ok {
@@ -772,6 +884,214 @@ func (a *App) handleUpdateSettings(c *gin.Context) {
 	}
 	a.store.WriteSettings(s)
 	c.JSON(200, s)
+}
+
+// ── Skill 库 Handler（用户浏览） ──────────────────────
+
+func (a *App) handleListSkills(c *gin.Context) {
+	all, _ := a.store.ReadSkillRegistry()
+	list := make([]*sharing.SkillRegistryEntry, 0, len(all))
+	for _, s := range all {
+		list = append(list, s)
+	}
+	c.JSON(200, gin.H{"skills": list})
+}
+
+func (a *App) handleGetSkill(c *gin.Context) {
+	entry := a.store.GetSkillRegistryEntry(c.Param("slug"))
+	if entry == nil {
+		c.JSON(404, gin.H{"error": "Skill 不存在"})
+		return
+	}
+	c.JSON(200, entry)
+}
+
+// ── 龙虾 Skill 管理 Handler ──────────────────────────
+
+func (a *App) handleListLobsterSkills(c *gin.Context) {
+	u := getUser(c)
+	l := a.store.GetLobster(c.Param("id"))
+	if l == nil || l.UserID != u.ID {
+		c.JSON(404, gin.H{"error": "龙虾不存在"})
+		return
+	}
+	installed, _ := a.store.ReadLobsterSkills(l.ID)
+	node := a.store.GetNode(l.NodeID)
+	var remoteSlugs []string
+	if node != nil {
+		slugs, err := a.nodeSvc.ListInstalledSkills(context.Background(), node, l.ID)
+		if err == nil {
+			remoteSlugs = slugs
+		}
+	}
+	registry, _ := a.store.ReadSkillRegistry()
+	type SkillInfo struct {
+		Slug        string `json:"slug"`
+		DisplayName string `json:"display_name"`
+		Summary     string `json:"summary"`
+		Icon        string `json:"icon"`
+		Version     string `json:"version"`
+		InstalledAt string `json:"installed_at,omitempty"`
+	}
+	var result []SkillInfo
+	seen := make(map[string]bool)
+	for _, slug := range remoteSlugs {
+		info := SkillInfo{Slug: slug}
+		if entry, ok := registry[slug]; ok {
+			info.DisplayName = entry.DisplayName
+			info.Summary = entry.Summary
+			info.Icon = entry.Icon
+			info.Version = entry.Version
+		} else {
+			info.DisplayName = slug
+		}
+		for _, ls := range installed {
+			if ls.Slug == slug {
+				info.InstalledAt = ls.InstalledAt
+				break
+			}
+		}
+		seen[slug] = true
+		result = append(result, info)
+	}
+	for _, ls := range installed {
+		if !seen[ls.Slug] {
+			info := SkillInfo{Slug: ls.Slug, InstalledAt: ls.InstalledAt, Version: ls.Version}
+			if entry, ok := registry[ls.Slug]; ok {
+				info.DisplayName = entry.DisplayName
+				info.Summary = entry.Summary
+				info.Icon = entry.Icon
+			} else {
+				info.DisplayName = ls.Slug
+			}
+			result = append(result, info)
+		}
+	}
+	if result == nil {
+		result = []SkillInfo{}
+	}
+	c.JSON(200, gin.H{"skills": result})
+}
+
+func (a *App) handleInstallSkill(c *gin.Context) {
+	u := getUser(c)
+	l := a.store.GetLobster(c.Param("id"))
+	if l == nil || l.UserID != u.ID {
+		c.JSON(404, gin.H{"error": "龙虾不存在"})
+		return
+	}
+	var req struct {
+		Slug string `json:"slug"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的请求"})
+		return
+	}
+	if req.Slug == "" {
+		c.JSON(400, gin.H{"ok": false, "message": "slug 必填"})
+		return
+	}
+	skill := a.store.GetSkillRegistryEntry(req.Slug)
+	if skill == nil {
+		c.JSON(404, gin.H{"ok": false, "message": "Skill 库中不存在该 Skill"})
+		return
+	}
+	node := a.store.GetNode(l.NodeID)
+	if node == nil {
+		c.JSON(500, gin.H{"ok": false, "message": "节点不存在"})
+		return
+	}
+	if err := a.nodeSvc.InstallSkill(context.Background(), node, l.ID, skill); err != nil {
+		c.JSON(500, gin.H{"ok": false, "message": "安装 Skill 失败: " + err.Error()})
+		return
+	}
+	a.store.SaveLobsterSkill(l.ID, &sharing.LobsterSkill{
+		Slug:        skill.Slug,
+		Version:     skill.Version,
+		InstalledAt: time.Now().Format("2006-01-02 15:04:05"),
+	})
+	c.JSON(200, gin.H{"ok": true, "message": fmt.Sprintf("Skill %s 安装成功 ✨", skill.DisplayName)})
+}
+
+func (a *App) handleUninstallSkill(c *gin.Context) {
+	u := getUser(c)
+	l := a.store.GetLobster(c.Param("id"))
+	if l == nil || l.UserID != u.ID {
+		c.JSON(404, gin.H{"error": "龙虾不存在"})
+		return
+	}
+	slug := c.Param("slug")
+	if slug == "" {
+		c.JSON(400, gin.H{"ok": false, "message": "slug 必填"})
+		return
+	}
+	node := a.store.GetNode(l.NodeID)
+	if node == nil {
+		c.JSON(500, gin.H{"ok": false, "message": "节点不存在"})
+		return
+	}
+	if err := a.nodeSvc.UninstallSkill(context.Background(), node, l.ID, slug); err != nil {
+		c.JSON(500, gin.H{"ok": false, "message": "卸载 Skill 失败: " + err.Error()})
+		return
+	}
+	a.store.RemoveLobsterSkill(l.ID, slug)
+	c.JSON(200, gin.H{"ok": true, "message": fmt.Sprintf("Skill %s 已卸载", slug)})
+}
+
+// ── 管理员 Skill 库管理 Handler ──────────────────────
+
+func (a *App) handleAdminListSkills(c *gin.Context) {
+	all, _ := a.store.ReadSkillRegistry()
+	list := make([]*sharing.SkillRegistryEntry, 0, len(all))
+	for _, s := range all {
+		list = append(list, s)
+	}
+	c.JSON(200, gin.H{"skills": list})
+}
+
+func (a *App) handleAdminCreateSkill(c *gin.Context) {
+	var entry sharing.SkillRegistryEntry
+	if err := c.ShouldBindJSON(&entry); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的 JSON"})
+		return
+	}
+	if entry.Slug == "" {
+		c.JSON(400, gin.H{"ok": false, "message": "slug 必填"})
+		return
+	}
+	if entry.DisplayName == "" {
+		entry.DisplayName = entry.Slug
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	entry.CreatedAt = now
+	entry.UpdatedAt = now
+	a.store.SaveSkillRegistryEntry(&entry)
+	c.JSON(201, gin.H{"ok": true, "skill": entry})
+}
+
+func (a *App) handleAdminUpdateSkill(c *gin.Context) {
+	slug := c.Param("slug")
+	existing := a.store.GetSkillRegistryEntry(slug)
+	if existing == nil {
+		c.JSON(404, gin.H{"ok": false, "message": "Skill 不存在"})
+		return
+	}
+	var updates sharing.SkillRegistryEntry
+	if err := c.ShouldBindJSON(&updates); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的 JSON"})
+		return
+	}
+	updates.Slug = slug
+	updates.CreatedAt = existing.CreatedAt
+	updates.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+	a.store.SaveSkillRegistryEntry(&updates)
+	c.JSON(200, gin.H{"ok": true, "skill": updates})
+}
+
+func (a *App) handleAdminDeleteSkill(c *gin.Context) {
+	slug := c.Param("slug")
+	a.store.DeleteSkillRegistryEntry(slug)
+	c.JSON(200, gin.H{"ok": true})
 }
 
 // ── 辅助函数 ──────────────────────────────────────────
@@ -863,9 +1183,19 @@ func (a *App) handleQRCode(c *gin.Context) {
 
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.GetHeader("Origin")
+		// Allow same-origin and common development origins
+		allowedOrigins := map[string]bool{
+			"http://localhost:5173": true,
+			"http://localhost:3000": true,
+			"http://127.0.0.1:5173": true,
+		}
+		if origin != "" && (allowedOrigins[origin] || strings.HasPrefix(origin, c.Request.Host)) {
+			c.Header("Access-Control-Allow-Origin", origin)
+		}
 		c.Header("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token, X-User-Token")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token, X-User-Token, Authorization")
+		c.Header("Access-Control-Allow-Credentials", "true")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return

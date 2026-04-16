@@ -23,6 +23,7 @@ Thumbs.db
 
 # Data (runtime)
 ~/.pinhaoclaw/
+.pinhaoclaw.pid
 
 # Env
 .env
@@ -30,3 +31,6 @@ Thumbs.db
 
 # Local ops / deployment scripts
 scripts/
+
+# Temporary build artifacts
+.tmp/

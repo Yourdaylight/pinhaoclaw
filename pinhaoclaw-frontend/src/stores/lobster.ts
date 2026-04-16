@@ -8,8 +8,11 @@ export const useLobsterStore = defineStore("lobster", () => {
 
   async function fetchAll() {
     loading.value = true;
-    lobsters.value = await lobsterApi.list();
-    loading.value = false;
+    try {
+      lobsters.value = await lobsterApi.list();
+    } finally {
+      loading.value = false;
+    }
   }
 
   async function create(name: string, region?: string) {

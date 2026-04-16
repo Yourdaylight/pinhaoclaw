@@ -70,13 +70,13 @@
                 </div>
                 <div class="info-row">
                   <span class="label">微信绑定：</span>
-                  <el-tag :type="l.weixinBound ? 'success' : 'info'" size="small">
-                    {{ l.weixinBound ? "已绑定 ✅" : "未绑定" }}
+                  <el-tag :type="l.weixin_bound ? 'success' : 'info'" size="small">
+                    {{ l.weixin_bound ? "已绑定 ✅" : "未绑定" }}
                   </el-tag>
                 </div>
                 <div class="info-row">
                   <span class="label">创建时间：</span>
-                  <span>{{ formatTime(l.createdAt) }}</span>
+                  <span>{{ formatTime(l.created_at) }}</span>
                 </div>
 
                 <el-divider style="margin: 12px 0" />
@@ -92,7 +92,7 @@
 
                 <div class="card-actions">
                   <el-button
-                    v-if="!l.weixinBound && l.status === 'running'"
+                    v-if="!l.weixin_bound && (l.status === 'running' || l.status === 'created')"
                     type="primary"
                     size="small"
                     @click="onBind(l.id)"
@@ -250,6 +250,7 @@ import { useLobsterStore } from "../../stores/lobster";
 import { authApi } from "../../api/auth";
 // #ifdef H5
 import { Plus, UserFilled } from "@element-plus/icons-vue";
+import { ElMessage } from "element-plus";
 // #endif
 // #ifndef H5
 import LobsterCard from "../../components/LobsterCard.vue";
@@ -274,6 +275,10 @@ onMounted(async () => {
   if (!userStore.isLoggedIn) {
     uni.reLaunch({ url: "/pages/login/index" });
     return;
+  }
+  // Fetch user profile (fills userName etc.) if not yet populated
+  if (!userStore.userName) {
+    userStore.fetchMe().catch(() => {});
   }
   uni.showLoading({ title: "加载中..." });
   await lobsterStore.fetchAll();
@@ -307,7 +312,7 @@ async function doCreate() {
     .then(() => {
       showCreate.value = false;
       // #ifdef H5
-      // Element Plus message
+      ElMessage.success("龙虾已创建 🦞");
       // #endif
       // #ifndef H5
       uni.showToast({ title: "龙虾已创建 🦞", icon: "success" });
@@ -326,21 +331,60 @@ async function onBind(id: string) {
 }
 
 async function onStop(id: string) {
-  await lobsterStore.stop(id)
-    .then(() => {})
-    .catch(() => {});
+  try {
+    await lobsterStore.stop(id);
+    // #ifdef H5
+    ElMessage.success("龙虾已停止");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: "龙虾已停止", icon: "success" });
+    // #endif
+  } catch {
+    // #ifdef H5
+    ElMessage.error("停止失败");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: "停止失败", icon: "error" });
+    // #endif
+  }
 }
 
 async function onStart(id: string) {
-  await lobsterStore.start(id)
-    .then(() => {})
-    .catch(() => {});
+  try {
+    await lobsterStore.start(id);
+    // #ifdef H5
+    ElMessage.success("龙虾已启动");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: "龙虾已启动", icon: "success" });
+    // #endif
+  } catch {
+    // #ifdef H5
+    ElMessage.error("启动失败");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: "启动失败", icon: "error" });
+    // #endif
+  }
 }
 
 async function onDelete(id: string, name: string) {
-  await lobsterStore.remove(id)
-    .then(() => {})
-    .catch(() => {});
+  try {
+    await lobsterStore.remove(id);
+    // #ifdef H5
+    ElMessage.success("龙虾已释放");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: "龙虾已释放", icon: "success" });
+    // #endif
+  } catch {
+    // #ifdef H5
+    ElMessage.error("释放失败");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: "释放失败", icon: "error" });
+    // #endif
+  }
 }
 
 // ── H5 辅助函数 ──
@@ -355,13 +399,15 @@ function statusLabel(s: string): string {
 }
 
 function calcQuota(l: any): number {
-  if (!l.quotaLimit) return 0;
-  return Math.min(100, Math.round((l.quotaUsed / l.quotaLimit) * 100));
+  const limit = l.monthly_token_limit;
+  if (!limit) return 0;
+  return Math.min(100, Math.round((l.monthly_token_used / limit) * 100));
 }
 
 function quotaStatus(l: any): "" | "success" | "warning" | "exception" {
-  if (!l.quotaLimit) return "";
-  const p = l.quotaUsed / l.quotaLimit;
+  const limit = l.monthly_token_limit;
+  if (!limit) return "";
+  const p = l.monthly_token_used / limit;
   if (p >= 0.95) return "exception";
   if (p >= 0.75) return "warning";
   return "success";

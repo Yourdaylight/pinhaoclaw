@@ -3,7 +3,10 @@ import { ref, computed } from "vue";
 import { authApi } from "../api/auth";
 
 export const useUserStore = defineStore("user", () => {
-  const token = ref<string>(uni.getStorageSync("pc_user_token") || "");
+  const token = ref<string>(
+    uni.getStorageSync("casdoor_auth_token") ||
+    uni.getStorageSync("pc_user_token") || ""
+  );
   const userId = ref<string>(uni.getStorageSync("pc_user_id") || "");
   const userName = ref<string>(uni.getStorageSync("pc_user_name") || "");
   const maxLobsters = ref<number>(Number(uni.getStorageSync("pc_max_lobsters")) || 3);
@@ -34,12 +37,33 @@ export const useUserStore = defineStore("user", () => {
     uni.setStorageSync("pc_user_name", res.user.name);
   }
 
-  function logout() {
+  async function logout() {
+    // Grab token before clearing
+    const currentToken = token.value;
+
+    const hadSidecarToken = !!uni.getStorageSync("casdoor_auth_token");
+
+    if (currentToken && hadSidecarToken) {
+      try {
+        await authApi.logout();
+      } catch {
+        // Force re-login locally even if sidecar cleanup fails.
+      }
+    }
+
+    // Clear local state
     token.value = "";
     userId.value = "";
     userName.value = "";
     maxLobsters.value = 3;
-    uni.clearStorageSync();
+    uni.removeStorageSync("pc_user_token");
+    uni.removeStorageSync("pc_user_id");
+    uni.removeStorageSync("pc_user_name");
+    uni.removeStorageSync("pc_max_lobsters");
+    uni.removeStorageSync("casdoor_auth_token");
+    // Mark that user explicitly logged out (next login should force re-auth)
+    uni.setStorageSync("force_relogin", "1");
+
     uni.reLaunch({ url: "/pages/login/index" });
   }
 

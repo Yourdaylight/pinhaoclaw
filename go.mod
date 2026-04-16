@@ -1,4 +1,4 @@
-module github.com/garden/pinhaoclaw
+module github.com/pinhaoclaw/pinhaoclaw
 
 go 1.22
 

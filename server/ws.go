@@ -22,20 +22,13 @@ var wsUpgrader = websocket.Upgrader{
 // 和 SSE 版共享同一套 BindWeixin 逻辑，消息格式保持一致
 func (a *App) handleBindWeixinWS(c *gin.Context) {
 	// 手动验证 token（WebSocket 握手无法设置自定义 Header）
-	token := c.Query("token")
+	token := userTokenFromRequest(c.Request, true)
 	if token == "" {
 		c.JSON(401, gin.H{"error": "请先登录"})
 		return
 	}
-	users, _ := a.store.ReadUsers()
-	var currentUser interface{}
-	for _, u := range users {
-		if u.SessionToken == token {
-			currentUser = u
-			break
-		}
-	}
-	if currentUser == nil {
+	currentUser, err := a.authenticateUserToken(token)
+	if err != nil {
 		c.JSON(401, gin.H{"error": "登录已过期"})
 		return
 	}
@@ -44,6 +37,12 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 	l := a.store.GetLobster(lobsterID)
 	if l == nil {
 		c.JSON(404, gin.H{"error": "龙虾不存在"})
+		return
+	}
+
+	// 校验龙虾所有权
+	if l.UserID != currentUser.ID {
+		c.JSON(403, gin.H{"error": "无权操作此龙虾"})
 		return
 	}
 
@@ -79,7 +78,7 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 	send("progress", "start", "正在连接远端节点...")
 
 	ctx := c.Request.Context()
-	outCh, errCh := a.nodeSvc.BindWeixin(ctx, node)
+	outCh, errCh := a.nodeSvc.BindWeixin(ctx, node, lobsterID)
 
 	var qrSent, loginSuccess bool
 
@@ -137,7 +136,7 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 		a.store.SaveLobster(l)
 
 		send("progress", "restart", "正在重启 picoclaw gateway...")
-		_ = a.nodeSvc.RestartGateway(ctx, node)
+		_ = a.nodeSvc.RestartInstance(ctx, node, l)
 
 		sendData("done", map[string]string{
 			"stage":   "done",

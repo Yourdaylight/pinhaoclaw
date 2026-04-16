@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MSG_FILE="${1:?missing commit message file}"
+FIRST_LINE="$(sed -n '1p' "$MSG_FILE" | tr -d '\r')"
+PATTERN='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([[:alnum:]._/-]+\))?!?: .+$'
+
+if [[ -z "$FIRST_LINE" ]]; then
+  echo 'commit message cannot be empty' >&2
+  exit 1
+fi
+
+if [[ "$FIRST_LINE" =~ ^(Merge|Revert[[:space:]]|fixup\!|squash\!) ]]; then
+  exit 0
+fi
+
+if [[ ! "$FIRST_LINE" =~ $PATTERN ]]; then
+  cat >&2 <<'EOF'
+invalid commit message.
+
+expected format:
+  type(scope): summary
+
+examples:
+  feat(auth): add sidecar login bridge
+  fix(server): reject missing websocket token
+  docs(readme): align auth mode docs
+EOF
+  exit 1
+fi
+
+if ((${#FIRST_LINE} > 72)); then
+  echo 'commit summary must be 72 characters or fewer' >&2
+  exit 1
+fi

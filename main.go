@@ -7,8 +7,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/garden/pinhaoclaw/config"
-	"github.com/garden/pinhaoclaw/server"
+	"github.com/pinhaoclaw/pinhaoclaw/config"
+	"github.com/pinhaoclaw/pinhaoclaw/server"
 )
 
 func main() {
@@ -41,8 +41,8 @@ func main() {
 	log.Printf("  数据目录: %s", cfg.ShareClawHome)
 	log.Printf("  前端目录: %s", cfg.FrontendDir)
 	log.Printf("  认证模式: %s", cfg.AuthMode)
-	if cfg.CasdoorEnabled() {
-		log.Printf("[PinHaoClaw] 🔐 Casdoor 已启用: endpoint=%s app=%s redirect=%s", cfg.CasdoorEndpoint, cfg.CasdoorApplication, cfg.CasdoorRedirectURL())
+	if cfg.SidecarEnabled() {
+		log.Printf("[PinHaoClaw] 🔐 统一认证已启用: sidecar=%s", cfg.AuthSidecarURL)
 	}
 
 	if cfg.AdminPassword == "" {

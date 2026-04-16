@@ -3,6 +3,7 @@ import type { Lobster } from "./lobster";
 
 export interface Node {
   id: string;
+  type?: "ssh" | "local";
   name: string;
   host: string;
   ssh_port: number;
@@ -12,6 +13,8 @@ export interface Node {
   status: string;
   current_count: number;
   max_lobsters: number;
+  remote_home?: string;
+  picoclaw_path?: string;
   created_at: string;
 }
 

@@ -13,32 +13,33 @@ type AuthMode string
 
 const (
 	AuthModeInvite  AuthMode = "invite"
-	AuthModeCasdoor AuthMode = "casdoor"
+	AuthModeSidecar AuthMode = "sidecar"
 )
 
 type Config struct {
-	ShareClawHome       string
-	FrontendDir         string
-	AuthMode            AuthMode
-	AdminPassword       string
-	AdminPath           string // 管理后台隐藏路径，如 /manage-xxxx
-	RemoteHost          string
-	RemoteSSHPort       int
-	RemoteUser          string
-	RemoteKeyPath       string
-	RemotePassword      string
-	RemoteHome          string
-	RemoteRegion        string
-	PublicOrigin        string
-	CasdoorEndpoint     string
-	CasdoorClientID     string
-	CasdoorClientSecret string
-	CasdoorOrganization string
-	CasdoorApplication  string
-	CasdoorRedirectPath string
+	ShareClawHome   string
+	FrontendDir     string
+	AuthMode        AuthMode
+	AdminPassword   string
+	AdminPath       string
+	RemoteHost      string
+	RemoteSSHPort   int
+	RemoteUser      string
+	RemoteKeyPath   string
+	RemotePassword  string
+	RemoteHome      string
+	RemoteRegion    string
+	PublicOrigin    string
+	AuthSidecarURL  string // e.g. http://localhost:9098 or https://auth.example.com
+	CasdoorEndpoint string // e.g. https://auth.example.com
 }
 
 func Load() (*Config, error) {
+	// Load .env file first (real env vars take precedence)
+	if err := loadDotEnv(); err != nil {
+		return nil, fmt.Errorf("加载 .env 文件失败: %w", err)
+	}
+
 	homeDir, _ := os.UserHomeDir()
 
 	sshPort, err := envInt("PINHAOCLAW_REMOTE_SSH_PORT", 22)
@@ -47,27 +48,23 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		ShareClawHome:       cleanPath(envOr("PINHAOCLAW_HOME", filepath.Join(homeDir, ".pinhaoclaw"))),
-		FrontendDir:         cleanPath(envOr("PINHAOCLAW_FRONTEND_DIR", filepath.Join("pinhaoclaw-frontend", "dist", "build", "h5"))),
-		AdminPassword:       os.Getenv("PINHAOCLAW_ADMIN_PASSWORD"),
-		AdminPath:           normalizeSlashPath(envOr("PINHAOCLAW_ADMIN_PATH", "")),
-		RemoteHost:          os.Getenv("PINHAOCLAW_REMOTE_HOST"),
-		RemoteUser:          envOr("PINHAOCLAW_REMOTE_USER", "root"),
-		RemoteKeyPath:       cleanPath(os.Getenv("PINHAOCLAW_REMOTE_KEY_PATH")),
-		RemotePassword:      os.Getenv("PINHAOCLAW_REMOTE_PASSWORD"),
-		RemoteHome:          cleanPath(envOr("PINHAOCLAW_REMOTE_HOME", "/opt/pinhaoclaw")),
-		RemoteRegion:        envOr("PINHAOCLAW_REMOTE_REGION", "华南"),
-		RemoteSSHPort:       sshPort,
-		PublicOrigin:        strings.TrimRight(envOr("PINHAOCLAW_PUBLIC_ORIGIN", "http://localhost:9000"), "/"),
-		CasdoorEndpoint:     strings.TrimRight(os.Getenv("PINHAOCLAW_CASDOOR_ENDPOINT"), "/"),
-		CasdoorClientID:     os.Getenv("PINHAOCLAW_CASDOOR_CLIENT_ID"),
-		CasdoorClientSecret: os.Getenv("PINHAOCLAW_CASDOOR_CLIENT_SECRET"),
-		CasdoorOrganization: envOr("PINHAOCLAW_CASDOOR_ORGANIZATION", "JQ"),
-		CasdoorApplication:  envOr("PINHAOCLAW_CASDOOR_APPLICATION", "app_pinhaoclaw_jq"),
-		CasdoorRedirectPath: normalizeSlashPath(envOr("PINHAOCLAW_CASDOOR_REDIRECT_PATH", "/api/auth/callback")),
+		ShareClawHome:   cleanPath(envOr("PINHAOCLAW_HOME", filepath.Join(homeDir, ".pinhaoclaw"))),
+		FrontendDir:     cleanPath(envOr("PINHAOCLAW_FRONTEND_DIR", filepath.Join("pinhaoclaw-frontend", "dist", "build", "h5"))),
+		AdminPassword:   os.Getenv("PINHAOCLAW_ADMIN_PASSWORD"),
+		AdminPath:       normalizeSlashPath(envOr("PINHAOCLAW_ADMIN_PATH", "")),
+		RemoteHost:      os.Getenv("PINHAOCLAW_REMOTE_HOST"),
+		RemoteUser:      envOr("PINHAOCLAW_REMOTE_USER", "root"),
+		RemoteKeyPath:   cleanPath(os.Getenv("PINHAOCLAW_REMOTE_KEY_PATH")),
+		RemotePassword:  os.Getenv("PINHAOCLAW_REMOTE_PASSWORD"),
+		RemoteHome:      cleanPath(envOr("PINHAOCLAW_REMOTE_HOME", "/opt/pinhaoclaw")),
+		RemoteRegion:    envOr("PINHAOCLAW_REMOTE_REGION", "华南"),
+		RemoteSSHPort:   sshPort,
+		PublicOrigin:    strings.TrimRight(envOr("PINHAOCLAW_PUBLIC_ORIGIN", "http://localhost:9000"), "/"),
+		AuthSidecarURL:  strings.TrimRight(envOr("PINHAOCLAW_AUTH_SIDECAR_URL", ""), "/"),
+		CasdoorEndpoint: strings.TrimRight(envOr("PINHAOCLAW_CASDOOR_ENDPOINT", ""), "/"),
 	}
 
-	cfg.AuthMode, err = resolveAuthMode(os.Getenv("PINHAOCLAW_AUTH_MODE"), cfg.hasAnyCasdoorSetting())
+	cfg.AuthMode, err = resolveAuthMode(os.Getenv("PINHAOCLAW_AUTH_MODE"), cfg.AuthSidecarURL != "")
 	if err != nil {
 		return nil, err
 	}
@@ -94,24 +91,11 @@ func (c *Config) Validate() error {
 	if err := validateHTTPURL("PINHAOCLAW_PUBLIC_ORIGIN", c.PublicOrigin); err != nil {
 		problems = append(problems, err.Error())
 	}
-	if c.AuthMode == AuthModeCasdoor {
-		if c.CasdoorEndpoint == "" {
-			problems = append(problems, "PINHAOCLAW_CASDOOR_ENDPOINT 不能为空（当前认证模式为 casdoor）")
-		}
-		if c.CasdoorClientID == "" {
-			problems = append(problems, "PINHAOCLAW_CASDOOR_CLIENT_ID 不能为空（当前认证模式为 casdoor）")
-		}
-		if c.CasdoorClientSecret == "" {
-			problems = append(problems, "PINHAOCLAW_CASDOOR_CLIENT_SECRET 不能为空（当前认证模式为 casdoor）")
-		}
-		if c.CasdoorApplication == "" {
-			problems = append(problems, "PINHAOCLAW_CASDOOR_APPLICATION 不能为空（当前认证模式为 casdoor）")
-		}
-		if err := validateHTTPURL("PINHAOCLAW_CASDOOR_ENDPOINT", c.CasdoorEndpoint); err != nil {
+	if c.AuthMode == AuthModeSidecar {
+		if c.AuthSidecarURL == "" {
+			problems = append(problems, "PINHAOCLAW_AUTH_SIDECAR_URL 不能为空（当前认证模式为 sidecar）")
+		} else if err := validateHTTPURL("PINHAOCLAW_AUTH_SIDECAR_URL", c.AuthSidecarURL); err != nil {
 			problems = append(problems, err.Error())
-		}
-		if c.CasdoorRedirectPath == "" || !strings.HasPrefix(c.CasdoorRedirectPath, "/") {
-			problems = append(problems, "PINHAOCLAW_CASDOOR_REDIRECT_PATH 必须以 / 开头")
 		}
 	}
 	if len(problems) > 0 {
@@ -142,31 +126,23 @@ func (c *Config) PrepareForStart() error {
 	return nil
 }
 
-func (c *Config) CasdoorEnabled() bool {
-	return c.AuthMode == AuthModeCasdoor
+func (c *Config) SidecarEnabled() bool {
+	return c.AuthMode == AuthModeSidecar
 }
 
-func (c *Config) CasdoorRedirectURL() string {
-	return strings.TrimRight(c.PublicOrigin, "/") + c.CasdoorRedirectPath
-}
-
-func (c *Config) hasAnyCasdoorSetting() bool {
-	return c.CasdoorEndpoint != "" || c.CasdoorClientID != "" || c.CasdoorClientSecret != ""
-}
-
-func resolveAuthMode(raw string, hasCasdoorSetting bool) (AuthMode, error) {
+func resolveAuthMode(raw string, hasSidecarURL bool) (AuthMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", "auto":
-		if hasCasdoorSetting {
-			return AuthModeCasdoor, nil
+		if hasSidecarURL {
+			return AuthModeSidecar, nil
 		}
 		return AuthModeInvite, nil
 	case string(AuthModeInvite):
 		return AuthModeInvite, nil
-	case string(AuthModeCasdoor):
-		return AuthModeCasdoor, nil
+	case string(AuthModeSidecar):
+		return AuthModeSidecar, nil
 	default:
-		return "", fmt.Errorf("PINHAOCLAW_AUTH_MODE 仅支持 invite / casdoor / auto，当前值: %s", raw)
+		return "", fmt.Errorf("PINHAOCLAW_AUTH_MODE 仅支持 invite / sidecar / auto，当前值: %s", raw)
 	}
 }
 

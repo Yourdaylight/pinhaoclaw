@@ -12,12 +12,12 @@ import (
 
 // SSHClient 封装 SSH 连接，用于远程服务器操作
 type SSHClient struct {
-	Host       string // IP 或域名
-	Port       int    // SSH 端口（默认 22）
-	User       string // 用户名（默认 root）
-	KeyPath    string // 私钥路径
-	Password   string // 密码（优先级低于 KeyPath）
-	Timeout    time.Duration
+	Host     string // IP 或域名
+	Port     int    // SSH 端口（默认 22）
+	User     string // 用户名（默认 root）
+	KeyPath  string // 私钥路径
+	Password string // 密码（优先级低于 KeyPath）
+	Timeout  time.Duration
 }
 
 // SSHPayload 远程命令执行结果
@@ -44,11 +44,41 @@ func NewSSHClient(host string, opts ...SSHOpts) *SSHClient {
 // SSHOpts SSH 配置选项
 type SSHOpts func(*SSHClient)
 
-func WithPort(port int) SSHOpts        { return func(c *SSHClient) { if port > 0 { c.Port = port } } }
-func WithUser(user string) SSHOpts      { return func(c *SSHClient) { if user != "" { c.User = user } } }
-func WithKeyPath(path string) SSHOpts   { return func(c *SSHClient) { if path != "" { c.KeyPath = path } } }
-func WithPassword(pw string) SSHOpts    { return func(c *SSHClient) { if pw != "" { c.Password = pw } } }
-func WithTimeout(d time.Duration) SSHOpts { return func(c *SSHClient) { if d > 0 { c.Timeout = d } } }
+func WithPort(port int) SSHOpts {
+	return func(c *SSHClient) {
+		if port > 0 {
+			c.Port = port
+		}
+	}
+}
+func WithUser(user string) SSHOpts {
+	return func(c *SSHClient) {
+		if user != "" {
+			c.User = user
+		}
+	}
+}
+func WithKeyPath(path string) SSHOpts {
+	return func(c *SSHClient) {
+		if path != "" {
+			c.KeyPath = path
+		}
+	}
+}
+func WithPassword(pw string) SSHOpts {
+	return func(c *SSHClient) {
+		if pw != "" {
+			c.Password = pw
+		}
+	}
+}
+func WithTimeout(d time.Duration) SSHOpts {
+	return func(c *SSHClient) {
+		if d > 0 {
+			c.Timeout = d
+		}
+	}
+}
 
 // Run 在远程主机执行命令并返回结果
 func (c *SSHClient) Run(ctx context.Context, cmd string) (*SSHPayload, error) {

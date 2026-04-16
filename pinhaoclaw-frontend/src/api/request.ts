@@ -21,6 +21,9 @@ export interface ApiResponse<T = any> {
 }
 
 function getToken(): string {
+  // Check sidecar token first (written by casdoor-auth-sidecar as casdoor_auth_token)
+  const sidecarToken = uni.getStorageSync("casdoor_auth_token") || "";
+  if (sidecarToken) return sidecarToken;
   return uni.getStorageSync("pc_user_token") || "";
 }
 
@@ -54,8 +57,14 @@ function request<T = any>(
       header: headers,
       success: (res) => {
         if (res.statusCode === 401) {
-          uni.removeStorageSync("pc_user_token");
-          uni.reLaunch({ url: "/pages/login/index" });
+          if (useAdminToken) {
+            uni.removeStorageSync("pc_admin_token");
+            // Don't redirect admin pages - let them handle it
+          } else {
+            uni.removeStorageSync("pc_user_token");
+            uni.removeStorageSync("casdoor_auth_token");
+            uni.reLaunch({ url: "/pages/login/index" });
+          }
           reject(new Error("登录已过期"));
           return;
         }

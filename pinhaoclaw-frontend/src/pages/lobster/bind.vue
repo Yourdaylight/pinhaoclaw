@@ -100,6 +100,11 @@ function addLog(msg: string) {
   setTimeout(() => { logScrollTop.value += 9999; }, 50);
 }
 
+function safeJSONParse<T>(data: string, fallback: T): T {
+  try { return JSON.parse(data); }
+  catch { return fallback; }
+}
+
 function handleMessage(event: string, stage: string, message: string, url?: string) {
   if (event === "qrcode" && url) {
     // 通过后端 /api/qrcode 将 URL 转为图片
@@ -140,21 +145,21 @@ function startBind() {
   eventSource = es;
 
   es.addEventListener("progress", (e) => {
-    const d = JSON.parse(e.data);
+    const d = safeJSONParse(e.data, { stage: "", message: "" });
     handleMessage("progress", d.stage, d.message);
   });
   es.addEventListener("qrcode", (e) => {
-    const d = JSON.parse(e.data);
+    const d = safeJSONParse(e.data, { stage: "", message: "", url: "" });
     handleMessage("qrcode", d.stage, d.message, d.url);
   });
   es.addEventListener("done", (e) => {
-    const d = JSON.parse(e.data);
+    const d = safeJSONParse(e.data, { stage: "", message: "" });
     handleMessage("done", d.stage, d.message);
     es.close();
   });
   es.addEventListener("error", (e) => {
     if ((e as MessageEvent).data) {
-      const d = JSON.parse((e as MessageEvent).data);
+      const d = safeJSONParse((e as MessageEvent).data, { stage: "", message: "" });
       handleMessage("error", d.stage, d.message);
     } else {
       handleMessage("error", "error", "连接断开");
@@ -177,7 +182,7 @@ function startBind() {
   socketTask = task;
 
   task.onMessage((res) => {
-    const d = JSON.parse(res.data as string);
+    const d = safeJSONParse(res.data as string, { event: "", stage: "", message: "" });
     handleMessage(d.event, d.stage, d.message, d.url);
   });
 

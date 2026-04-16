@@ -5,6 +5,7 @@
   "scripts": {
     "dev:h5": "uni",
     "build:h5": "uni build",
+    "test": "vitest run",
     "dev:mp-weixin": "uni -p mp-weixin",
     "build:mp-weixin": "uni build -p mp-weixin"
   },
@@ -22,8 +23,11 @@
     "@dcloudio/uni-cli-shared": "3.0.0-alpha-5000720260327001",
     "@dcloudio/vite-plugin-uni": "3.0.0-alpha-5000720260327001",
     "@types/node": "^20.11.5",
+    "@vue/test-utils": "^2.4.6",
     "@vitejs/plugin-vue": "^5.0.3",
+    "jsdom": "^26.1.0",
     "typescript": "^5.3.3",
-    "vite": "5.2.8"
+    "vite": "5.2.8",
+    "vitest": "^2.1.9"
   }
 }

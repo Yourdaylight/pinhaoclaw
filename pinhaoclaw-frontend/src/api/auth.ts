@@ -25,12 +25,11 @@ export interface MeResponse {
 }
 
 export interface AuthConfigResponse {
-  mode: "invite" | "casdoor";
-  casdoor_enabled: boolean;
-  organization?: string;
-  application?: string;
+  mode: "invite" | "sidecar";
+  sidecar_enabled: boolean;
   login_url?: string;
-  register_hint?: string;
+  casdoor_logout_url?: string;
+  organization?: string;
 }
 
 export const authApi = {
@@ -40,6 +39,8 @@ export const authApi = {
     http.post<LoginResponse>("/api/auth/login", { invite_code: inviteCode, name }),
 
   me: () => http.get<MeResponse>("/api/auth/me"),
+
+  logout: () => http.post<{ ok: boolean }>("/api/auth/sidecar/logout", {}),
 
   regions: () => http.get<{ regions: string[] }>("/api/regions"),
 };

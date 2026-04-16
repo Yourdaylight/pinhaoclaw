@@ -54,7 +54,7 @@
             <el-icon><Ticket /></el-icon> 邀请码
           </el-menu-item>
           <el-menu-item index="lobsters">
-            <el-icon><Coral /></el-icon> 龙虾管理
+            <el-icon><TrendCharts /></el-icon> 龙虾管理
           </el-menu-item>
           <el-menu-item index="settings">
             <el-icon><Setting /></el-icon> 系统设置
@@ -114,11 +114,19 @@
               </template>
 
               <el-table :data="nodes" stripe style="width: 100%">
+                <el-table-column prop="type" label="类型" width="80">
+                  <template #default="{ row }">
+                    <el-tag size="small" :type="row.type === 'local' ? 'success' : 'info'" effect="dark">
+                      {{ row.type === 'local' ? '本地' : 'SSH' }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
                 <el-table-column prop="name" label="名称" min-width="100" />
                 <el-table-column prop="region" label="区域" width="90">
                   <template #default="{ row }">{{ regionEmoji(row.region) }} {{ row.region }}</template>
                 </el-table-column>
                 <el-table-column prop="host" label="地址" min-width="140" font-mono />
+                <el-table-column prop="remote_home" label="目录" min-width="180" show-overflow-tooltip />
                 <el-table-column prop="status" label="状态" width="80">
                   <template #default="{ row }">
                     <el-tag :type="row.status === 'online' ? 'success' : 'info'" size="small" effect="dark">
@@ -235,14 +243,23 @@
     <!-- 添加节点对话框 -->
     <el-dialog v-model="addNodeVisible" title="添加节点" width="480px" destroy-on-close>
       <el-form :model="newNode" label-width="80px">
+        <el-form-item label="类型">
+          <el-select v-model="newNode.type" style="width: 100%">
+            <el-option label="SSH 节点" value="ssh" />
+            <el-option label="本地节点" value="local" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="名称">
           <el-input v-model="newNode.name" placeholder="如：华南-广州-01" />
         </el-form-item>
-        <el-form-item label="IP 地址">
-          <el-input v-model="newNode.host" placeholder="192.168.x.x 或 domain.com" />
+        <el-form-item :label="newNode.type === 'local' ? '节点标识' : 'IP 地址'">
+          <el-input v-model="newNode.host" :placeholder="newNode.type === 'local' ? 'local 或 127.0.0.1' : '192.168.x.x 或 domain.com'" />
         </el-form-item>
-        <el-form-item label="SSH 密码">
+        <el-form-item v-if="newNode.type === 'ssh'" label="SSH 密码">
           <el-input v-model="newNode.ssh_password" type="password" show-password placeholder="root 密码" />
+        </el-form-item>
+        <el-form-item v-if="newNode.type === 'local'" label="本地目录">
+          <el-input v-model="newNode.remote_home" placeholder="如：/home/you/.pinhaoclaw/local-node-01" />
         </el-form-item>
         <el-form-item label="区域">
           <el-select v-model="newNode.region" style="width: 100%">
@@ -290,7 +307,9 @@ import {
   Ticket,
   Setting,
   RefreshRight,
+  TrendCharts,
 } from "@element-plus/icons-vue";
+import { ElMessage } from "element-plus";
 const LockIcon = Lock;
 // #endif
 
@@ -339,9 +358,11 @@ const settingsForm = ref({ tokenLimitW: 100, spaceLimitMB: 2048, maxLobsters: 3 
 const addNodeVisible = ref(false);
 const nodeAdding = ref(false);
 const newNode = ref({
+  type: "ssh",
   name: "新节点",
   host: "",
   ssh_password: "",
+  remote_home: "",
   region: "华南",
 });
 
@@ -372,7 +393,14 @@ onMounted(async () => {
   if (stored) {
     isAuthed.value = true;
     loginVisible.value = false;
-    loadAll();
+    try {
+      await loadAll();
+    } catch {
+      // Token expired or invalid - show login dialog
+      isAuthed.value = false;
+      loginVisible.value = true;
+      uni.removeStorageSync("pc_admin_token");
+    }
   }
 });
 
@@ -410,7 +438,8 @@ async function doAdminLogin() {
     loginErr.value = "请输入密码";
     return;
   }
-  await adminApi.login(adminPwd.value).then((res) => {
+  try {
+    const res = await adminApi.login(adminPwd.value);
     if (res.ok) {
       uni.setStorageSync("pc_admin_token", res.token);
       isAuthed.value = true;
@@ -419,7 +448,9 @@ async function doAdminLogin() {
     } else {
       loginErr.value = res.message || "密码错误";
     }
-  });
+  } catch {
+    loginErr.value = "网络错误，请重试";
+  }
 }
 
 async function loadAll() {
@@ -440,13 +471,24 @@ async function loadAll() {
 }
 
 async function doAddNode() {
-  if (!newNode.value.host) return;
+  if (newNode.value.type === "local") {
+    if (!newNode.value.remote_home) {
+      ElMessage.warning("请输入本地目录");
+      return;
+    }
+    if (!newNode.value.host) {
+      newNode.value.host = "local";
+    }
+  } else if (!newNode.value.host) {
+    ElMessage.warning("请输入节点地址");
+    return;
+  }
   nodeAdding.value = true;
   await adminApi
     .addNode(newNode.value)
     .then(() => {
       addNodeVisible.value = false;
-      newNode.value = { name: "新节点", host: "", ssh_password: "", region: "华南" };
+      newNode.value = { type: "ssh", name: "新节点", host: "", ssh_password: "", remote_home: "", region: "华南" };
       adminApi.nodes().then((d) => (nodes.value = d));
     })
     .catch(() => {});
@@ -454,14 +496,33 @@ async function doAddNode() {
 }
 
 async function testNode(id: string) {
-  await adminApi.testNode(id)
-    .then((res) => {})
-    .catch(() => {});
+  try {
+    const res = await adminApi.testNode(id);
+    // #ifdef H5
+    if (res.ok) {
+      ElMessage.success("连接成功");
+    } else {
+      ElMessage.warning(res.message || "连接失败");
+    }
+    // #endif
+    adminApi.nodes().then((d) => (nodes.value = d));
+  } catch {
+    // #ifdef H5
+    ElMessage.error("测试连接失败");
+    // #endif
+  }
 }
 
 async function deleteNode(id: string) {
-  await adminApi.deleteNode(id).catch(() => {});
-  adminApi.nodes().then((d) => (nodes.value = d));
+  try {
+    await adminApi.deleteNode(id);
+    const d = await adminApi.nodes();
+    nodes.value = d;
+  } catch {
+    // #ifdef H5
+    ElMessage.error("删除节点失败");
+    // #endif
+  }
 }
 
 async function createInvite() {
@@ -479,27 +540,44 @@ async function createInvite() {
 function copyInviteLink(code: string) {
   // #ifdef H5
   const url = `${window.location.origin}/#/pages/login/index?code=${code}`;
-  navigator.clipboard?.writeText(url);
+  navigator.clipboard?.writeText(url).then(() => {
+    ElMessage.success("链接已复制");
+  }).catch(() => {
+    ElMessage.error("复制失败");
+  });
   // #endif
 }
 
 async function deleteInvite(code: string) {
-  await adminApi.deleteInvite(code).catch(() => {});
-  adminApi.invites().then((d) => (invites.value = d));
+  try {
+    await adminApi.deleteInvite(code);
+    const d = await adminApi.invites();
+    invites.value = d;
+  } catch {
+    // #ifdef H5
+    ElMessage.error("删除邀请码失败");
+    // #endif
+  }
 }
 
 async function saveSettings() {
-  await adminApi
-    .updateSettings({
+  try {
+    await adminApi.updateSettings({
       default_monthly_token_limit:
         (Number(settingsForm.value.tokenLimitW) || 100) * 10000,
       default_monthly_space_limit_mb:
         Number(settingsForm.value.spaceLimitMB) || 2048,
       default_max_lobsters_per_user:
         Number(settingsForm.value.maxLobsters) || 3,
-    })
-    .then(() => {})
-    .catch(() => {});
+    });
+    // #ifdef H5
+    ElMessage.success("设置已保存");
+    // #endif
+  } catch {
+    // #ifdef H5
+    ElMessage.error("保存失败");
+    // #endif
+  }
 }
 </script>
 
@@ -565,7 +643,7 @@ async function saveSettings() {
   border-radius: 8px;
 }
 
-.admin-footer {
+.sidebar-footer {
   margin-top: auto;
   padding: 16px 20px;
   display: flex;

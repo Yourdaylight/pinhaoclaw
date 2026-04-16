@@ -11,22 +11,16 @@
           </div>
         </template>
 
-        <div v-if="authMode === 'casdoor'" class="casdoor-mode">
+        <div v-if="authMode === 'sidecar'" class="sidecar-mode">
           <el-alert
-            title="已启用 Casdoor 统一认证"
+            title="已启用统一认证"
             type="success"
             show-icon
             :closable="false"
           />
 
-          <div class="casdoor-copy">
+          <div class="sidecar-copy">
             <p>登录与注册都由统一授权中心处理。</p>
-            <p>
-              新用户会直接注册到
-              <strong>{{ authConfig.organization || 'JQ' }}</strong>
-              组织下。
-            </p>
-            <p class="hint">{{ authConfig.register_hint || '在统一认证页点击注册即可完成开户。' }}</p>
           </div>
 
           <el-button
@@ -34,7 +28,7 @@
             size="large"
             class="login-btn"
             :loading="loading"
-            @click="goCasdoorLogin"
+            @click="goSidecarLogin"
           >
             前往统一认证中心
           </el-button>
@@ -99,10 +93,9 @@
       </view>
 
       <view class="card">
-        <template v-if="authMode === 'casdoor'">
+        <template v-if="authMode === 'sidecar'">
           <text class="card-title">已启用统一认证</text>
-          <text class="casdoor-tip">当前 Casdoor 登录流程优先支持 H5 浏览器访问，请使用部署后的 Web 地址登录或注册。</text>
-          <text class="casdoor-tip minor">注册完成后用户会自动进入 {{ authConfig.organization || 'JQ' }} 组织。</text>
+          <text class="sidecar-tip">当前统一登录流程优先支持 H5 浏览器访问，请使用部署后的 Web 地址登录或注册。</text>
         </template>
         <template v-else>
           <text class="card-title">输入邀请码</text>
@@ -143,10 +136,10 @@ const userStore = useUserStore();
 const inviteCode = ref("");
 const loading = ref(false);
 const errorMsg = ref("");
-const authMode = ref<"invite" | "casdoor">("invite");
+const authMode = ref<"invite" | "sidecar">("invite");
 const authConfig = ref<AuthConfigResponse>({
   mode: "invite",
-  casdoor_enabled: false,
+  sidecar_enabled: false,
 });
 
 onMounted(async () => {
@@ -164,28 +157,44 @@ onMounted(async () => {
   }
 
   // #ifdef H5
-  if (authMode.value !== "casdoor") {
-    const search = window.location.search;
-    const params = new URLSearchParams(
-      search.replace("#/", "").replace(/^.*\?/, "?")
-    );
-    const code = params.get("code");
-    if (code) inviteCode.value = code;
+  // Sidecar mode: check if we came back from sidecar with a token already in localStorage
+  if (authMode.value === "sidecar") {
+    const sidecarToken = localStorage.getItem("casdoor_auth_token");
+    if (sidecarToken) {
+      // Populate user info from server before redirecting
+      try {
+        await userStore.fetchMe();
+      } catch { /* ignore — will populate later */ }
+      uni.reLaunch({ url: "/pages/panel/index" });
+      return;
+    }
   }
   // #endif
 });
 
-function goCasdoorLogin() {
+function goSidecarLogin() {
   loading.value = true;
   errorMsg.value = "";
   // #ifdef H5
-  window.location.href = authConfig.value.login_url || "/api/auth/login/casdoor";
+  const loginUrl = authConfig.value.login_url;
+  if (!loginUrl) {
+    errorMsg.value = "未获取到登录地址";
+    loading.value = false;
+    return;
+  }
+  // If user explicitly logged out, force Casdoor to show login page (not auto-auth)
+  let url = loginUrl;
+  if (uni.getStorageSync("force_relogin")) {
+    url += (url.includes("?") ? "&" : "?") + "prompt=login";
+    uni.removeStorageSync("force_relogin");
+  }
+  window.location.href = url;
   // #endif
 }
 
 async function doLogin() {
-  if (authMode.value === "casdoor") {
-    goCasdoorLogin();
+  if (authMode.value === "sidecar") {
+    goSidecarLogin();
     return;
   }
 
@@ -253,24 +262,20 @@ async function doLogin() {
   margin: 0;
 }
 
-.casdoor-mode {
+.sidecar-mode {
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 
-.casdoor-copy {
+.sidecar-copy {
   color: #606266;
   font-size: 14px;
   line-height: 1.8;
 }
 
-.casdoor-copy p {
+.sidecar-copy p {
   margin: 0;
-}
-
-.casdoor-copy .hint {
-  color: #909399;
 }
 
 .login-btn {
@@ -357,16 +362,11 @@ async function doLogin() {
   margin-bottom: 8rpx;
 }
 
-.casdoor-tip {
+.sidecar-tip {
   color: rgba(255, 255, 255, 0.72);
   font-size: 26rpx;
   line-height: 1.8;
   text-align: center;
-}
-
-.casdoor-tip.minor {
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 24rpx;
 }
 
 .invite-input {

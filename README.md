@@ -6,7 +6,7 @@
 
 | 角色 | 说明 |
 |------|------|
-| **用户** | 通过邀请码或 Casdoor 统一认证登录，购买/管理自己的龙虾，查看 Token 和空间用量 |
+| **用户** | 通过邀请码或 sidecar 统一认证登录，购买/管理自己的龙虾，查看 Token 和空间用量 |
 | **龙虾 (Lobster)** | 一个独立的 picoclaw 实例，绑定用户微信，有独立的端口、Token 配额(100w/月) 和空间配额(2GB/月) |
 | **节点 (Node)** | 云服务器，可部署多只龙虾，标记区域标签（华南/华北/华东/华中/境外） |
 | **管理员** | 通过隐藏入口管理节点、邀请码、全局设置 |
@@ -18,8 +18,8 @@
 | 模式 | 值 | 说明 |
 |------|-----|------|
 | **邀请码** | `invite` | 原始模式：用户输入管理员发放的邀请码即可登录注册 |
-| **Casdoor 统一认证** | `casdoor` | 接入 [Casdoor](https://casdoor.org) 身份平台，用户在统一认证中心完成登录/注册（支持邮箱验证码+图形验证码），通过 OAuth 回调进入系统 |
-| **自动检测** | `auto`（默认） | 若配置了 `PINHAOCLAW_CASDOOR_*` 相关环境变量则走 Casdoor，否则 fallback 到邀请码模式 |
+| **Sidecar 统一认证** | `sidecar` | 通过 `casdoor-auth-sidecar` 代理统一认证；PinHaoClaw 负责登录转发、回调桥接和 token 校验 |
+| **自动检测** | `auto`（默认） | 若配置了 `PINHAOCLAW_AUTH_SIDECAR_URL` 则走 sidecar，否则 fallback 到邀请码模式 |
 
 > 两种模式下前端会根据 `/api/auth/config` 返回的 `mode` 自动渲染对应的登录页面。
 
@@ -40,13 +40,13 @@ pinhaoclaw/
 ├── server/
 │   ├── app.go               # Gin 路由 + 全部 Handler + 静态文件托管 + 敏感路径拦截
 │   ├── auth.go              # 邀请码认证 + 管理员 Token 认证
-│   ├── casdoor.go           # Casdoor OAuth 登录/回调/用户映射/登录桥接页
+│   ├── sidecar.go           # Sidecar 登录/回调代理、本地用户映射、统一认证桥接
 │   └── ws.go                # WebSocket Handler（小程序端微信绑定推送）
 │
 └── pinhaoclaw-frontend/     # uni-app Vue3 跨平台前端
     ├── src/
     │   ├── pages/
-    │   │   ├── login/       # 登录页（邀请码 / Casdoor 双模式自适应）
+    │   │   ├── login/       # 登录页（邀请码 / sidecar 双模式自适应）
     │   │   ├── panel/       # 用户龙虾面板
     │   │   ├── lobster/     # 绑定微信页（SSE/WebSocket 条件编译）
     │   │   └── admin/       # 管理后台（#ifdef H5 仅 Web 端）
@@ -98,11 +98,25 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 ```
 
 启动时会依次检查：
-1. 配置完整性（认证模式、URL 合法性、Casdoor 必填项）
+1. 配置完整性（认证模式、URL 合法性、sidecar 必填项）
 2. `PINHAOCLAW_HOME` 数据目录可写
 3. 前端 `index.html` 存在
 
 任一环节失败直接退出并打印原因。
+
+## 测试与验证现状
+
+当前仓库已经具备可执行的最小测试闭环：
+
+- 后端：`go test ./...` 通过
+- 后端构建：`go build ./...` 通过
+- 前端：`npm ci && npm test && npm run build:h5` 通过
+- 启动冒烟：可在临时数据目录下完成后端启动和 `/health` 检查
+
+仍需注意两点：
+
+- 当前前端测试是最小页面级测试，已覆盖登录页关键分支，但整体覆盖率仍偏低
+- README 曾长期保留 Casdoor 直连表述，实际实现已经切到 sidecar 统一认证；本文档以下内容已按真实代码修正
 
 ---
 
@@ -115,19 +129,15 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 | `PORT` | 监听端口 | `9000` |
 | `PINHAOCLAW_HOME` | 运行时数据目录（用户/龙虾/邀请码等 JSON） | `~/.pinhaoclaw` |
 | `PINHAOCLAW_FRONTEND_DIR` | H5 前端构建产物目录 | `pinhaoclaw-frontend/dist/build/h5` |
-| `PINHAOCLAW_AUTH_MODE` | 认证模式：`invite` / `casdoor` / `auto` | `auto` |
-| `PINHAOCLAW_PUBLIC_ORIGIN` | 对外访问地址，用于生成 Casdoor OAuth 回调 URL | `http://localhost:9000` |
+| `PINHAOCLAW_AUTH_MODE` | 认证模式：`invite` / `sidecar` / `auto` | `auto` |
+| `PINHAOCLAW_PUBLIC_ORIGIN` | 对外访问地址，用于生成统一认证回调 URL | `http://localhost:9000` |
 
-### Casdoor 统一认证（`casdoor` 模式必填）
+### Sidecar 统一认证
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `PINHAOCLAW_CASDOOR_ENDPOINT` | Casdoor 服务地址 | （空） |
-| `PINHAOCLAW_CASDOOR_CLIENT_ID` | Casdoor Application Client ID | （空） |
-| `PINHAOCLAW_CASDOOR_CLIENT_SECRET` | Casdoor Application Client Secret | （空） |
-| `PINHAOCLAW_CASDOOR_ORGANIZATION` | Casdoor 组织名 | `JQ` |
-| `PINHAOCLAW_CASDOOR_APPLICATION` | Casdoor 应用名 | `app_pinhaoclaw_jq` |
-| `PINHAOCLAW_CASDOOR_REDIRECT_PATH` | OAuth 回调路径 | `/api/auth/callback` |
+| `PINHAOCLAW_AUTH_SIDECAR_URL` | sidecar 服务地址；设置后 `auto` 会自动切换到 sidecar 模式 | （空） |
+| `PINHAOCLAW_CASDOOR_ENDPOINT` | Casdoor 外部地址；用于前端退出登录跳转 | （空） |
 
 ### 管理后台
 
@@ -156,13 +166,14 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 
 | 方法 | 路径 | 说明 | 适用模式 |
 |------|------|------|----------|
-| GET | `/api/auth/config` | 获取当前认证模式与 Casdoor 配置信息 | 全部 |
+| GET | `/api/auth/config` | 获取当前认证模式与统一认证入口信息 | 全部 |
 | POST | `/api/auth/login` | 邀请码登录 | `invite` |
-| GET | `/api/auth/login/casdoor` | 重定向到 Casdoor OAuth 授权页 | `casdoor` |
-| GET | `/api/auth/callback` | Casdoor OAuth 回调（code→token→本地用户） | `casdoor` |
+| GET | `/api/auth/sidecar/login` | 重定向到 sidecar 登录入口 | `sidecar` |
+| GET | `/api/auth/sidecar/callback` | sidecar 回调代理（code/state 原样透传） | `sidecar` |
+| GET | `/api/auth/sidecar/logout` | 注销 sidecar 会话并跳回登录页 | `sidecar` |
 | GET | `/api/auth/me` | 当前登录用户信息 | 全部 |
 
-> `casdoor` 模式下调用 `/api/auth/login` 会返回 400 并提示走统一认证入口。
+> `sidecar` 模式下调用 `/api/auth/login` 会返回 400，并提示走统一认证入口。
 
 ### 龙虾管理
 
@@ -173,7 +184,8 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 | GET | `/api/lobsters/:id` | 龙虾详情 |
 | GET | `/api/lobsters/:id/bind` | **SSE** 绑定微信（QR 码扫码） |
 | POST | `/api/lobsters/:id/start` | 启动龙虾 |
-| DELETE | `/api/lobsters/:id/stop` | 停止龙虾 |
+| POST | `/api/lobsters/:id/stop` | 停止龙虾 |
+| DELETE | `/api/lobsters/:id` | 删除龙虾 |
 | GET | `/api/qrcode?url=` | 二维码图片生成 |
 
 ### 管理后台
@@ -198,11 +210,12 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 4. 绑定微信 → SSE / WebSocket 流式推送 QR 码 → 扫码完成绑定
 5. 用量管理 → Token(100w/月) + Space(2GB/月) 配额，每月自动重置
 
-### casdoor（统一认证模式）
+### sidecar（统一认证模式）
 
-1. 用户访问登录页 → 点击「前往统一认证中心」跳转 Casdoor OAuth
-2. 在 Casdoor 完成注册/登录（邮箱验证码 + 图形验证码）
-3. OAuth 回调到 PinHaoClaw → 后端换 token → 按 Casdoor sub 映射/创建本地用户
+1. 用户访问登录页 → 点击统一认证入口，跳到 `/api/auth/sidecar/login`
+2. Sidecar 生成 state 并重定向到 Casdoor 完成认证
+3. Casdoor 回调进入 `/api/auth/sidecar/callback` → PinHaoClaw 透传给 sidecar 完成会话桥接
+4. 业务请求携带 token → 后端通过 sidecar `/api/auth/verify` 校验身份，并按 `sub` 映射/创建本地用户
 4. 进入控制台 → （后续步骤同上）
 
 ## 技术栈
@@ -212,11 +225,39 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 | **后端框架** | [Gin](https://github.com/gin-gonic/gin) |
 | **前端** | [uni-app](https://uniapp.net/) Vue3 + Element Plus (H5) / 原生组件 (小程序) |
 | **存储** | JSON 文件 (`PINHAOCLAW_HOME/*.json`)，`sync.RWMutex` 并发安全 |
-| **身份认证** | 邀请码（内置）/ Casdoor OAuth2 / OIDC JWT 解析 |
+| **身份认证** | 邀请码（内置）/ sidecar 统一认证 / 本地用户映射 |
 | **远程部署** | SSH（密码/密钥双模式），StreamRun PTY 流式执行 |
 | **实时推送** | SSE (H5 微信绑定) / WebSocket (小程序微信绑定) |
 | **二维码** | [`github.com/skip2/go-qrcode`](https://github.com/skip2/go-qrcode) 服务端 PNG 生成 |
 | **部署形态** | 单二进制 + 静态文件内嵌，systemd 托管 |
+
+## 提交质量门禁
+
+仓库内已提供一套可版本化的 commit / push / PR 质量门禁：
+
+1. 安装本地 hooks
+
+```bash
+./tools/setup-git-hooks.sh
+```
+
+2. 本地快速检查（适合提交前手动跑）
+
+```bash
+./tools/quality-gate.sh commit
+```
+
+3. 本地完整检查（等价于 pre-push / PR）
+
+```bash
+./tools/quality-gate.sh push
+```
+
+门禁规则如下：
+
+- `commit-msg`：强制 Conventional Commits，限制标题长度，拦截不可审计的提交信息
+- `pre-push`：执行 Go 格式检查、Go 测试、Go 构建、前端页面测试、前端 H5 构建、启动冒烟检查
+- GitHub Actions PR 校验：在干净环境中执行同一套 `push` 级校验，避免“我本地能过”
 
 ## 安全设计
 
@@ -224,7 +265,7 @@ npm run build:mp-weixin   # 产物在 dist/build/mp-weixin/
 - **管理后台**：随机隐藏路径 + 密码保护；未设密码时登录接口直接禁用
 - **Token 安全**：仅通过 HTTP Header (`X-User-Token` / `X-Admin-Token`) 传递，拒绝 Query 参数注入
 - **路径隔离**：`/scripts`、`/.git`、`.env`、源码文件等敏感路径被显式拦截返回 404，不回退到 SPA index.html
-- **OAuth State 防 CSRF**：Casdoor 登录携带一次性 state 参数，回调时严格校验
+- **统一认证隔离**：OAuth state、token 交换和会话管理下沉到 sidecar，业务服务只做入口代理和 token 校验
 - **SSH 安全**：连接超时控制，StreamRun 6 分钟上限；QR 码 URL 服务端一次性渲染
 
 ## License
