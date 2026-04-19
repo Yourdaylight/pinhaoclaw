@@ -1,10 +1,14 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -328,5 +332,84 @@ func TestCreateLobster_ReleasesLockAfterInvalidRequest(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("second create request blocked, mutex was not released")
+	}
+}
+
+func TestHandleAdminUploadSkill_SavesManagedSkillAndRegistry(t *testing.T) {
+	app, dir := newTestApp(t)
+
+	zipPath := filepath.Join(t.TempDir(), "demo-skill.zip")
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatalf("create zip: %v", err)
+	}
+	zw := zip.NewWriter(zipFile)
+	skillFile, err := zw.Create("demo-skill/SKILL.md")
+	if err != nil {
+		t.Fatalf("create skill entry: %v", err)
+	}
+	if _, err := skillFile.Write([]byte("# Demo Skill")); err != nil {
+		t.Fatalf("write skill entry: %v", err)
+	}
+	dataFile, err := zw.Create("demo-skill/scripts/run.sh")
+	if err != nil {
+		t.Fatalf("create data entry: %v", err)
+	}
+	if _, err := dataFile.Write([]byte("echo demo")); err != nil {
+		t.Fatalf("write data entry: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	if err := zipFile.Close(); err != nil {
+		t.Fatalf("close zip file: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	_ = writer.WriteField("slug", "demo-skill")
+	_ = writer.WriteField("display_name", "Demo Skill")
+	_ = writer.WriteField("summary", "uploaded from zip")
+	_ = writer.WriteField("version", "1.0.0")
+	part, err := writer.CreateFormFile("file", filepath.Base(zipPath))
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	zipBytes, err := os.ReadFile(zipPath)
+	if err != nil {
+		t.Fatalf("read zip bytes: %v", err)
+	}
+	if _, err := part.Write(zipBytes); err != nil {
+		t.Fatalf("write multipart zip: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/skills/upload", body)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	app.handleAdminUploadSkill(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", w.Code, w.Body.String())
+	}
+	entry := app.store.GetSkillRegistryEntry("demo-skill")
+	if entry == nil {
+		t.Fatal("expected skill registry entry to be created")
+	}
+	if entry.Source.Type != "uploaded" {
+		t.Fatalf("expected uploaded source type, got %q", entry.Source.Type)
+	}
+	if entry.Source.LocalDir != filepath.Join(dir, "skill_packages", "demo-skill") {
+		t.Fatalf("unexpected managed skill dir: %s", entry.Source.LocalDir)
+	}
+	if _, err := os.Stat(filepath.Join(entry.Source.LocalDir, "SKILL.md")); err != nil {
+		t.Fatalf("expected managed SKILL.md: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(entry.Source.LocalDir, "scripts", "run.sh")); err != nil {
+		t.Fatalf("expected managed script file: %v", err)
 	}
 }

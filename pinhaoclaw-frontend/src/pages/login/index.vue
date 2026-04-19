@@ -127,6 +127,7 @@
 import { ref, onMounted } from "vue";
 import { useUserStore } from "../../stores/user";
 import { authApi, type AuthConfigResponse } from "../../api/auth";
+import { http } from "../../api/request";
 // #ifdef H5
 import { Key } from "@element-plus/icons-vue";
 const KeyIcon = Key;
@@ -143,6 +144,22 @@ const authConfig = ref<AuthConfigResponse>({
 });
 
 onMounted(async () => {
+  // #ifdef H5
+  // 如果当前访问的是隐藏管理路径（例如 /mgr-x8kP2mQa），优先切到管理后台页面
+  const pathnameSegment = (window.location.pathname || "").split("/").filter(Boolean)[0] || "";
+  if (pathnameSegment) {
+    try {
+      const gate: any = await http.get("/api/admin/gate?path=" + pathnameSegment);
+      if (gate?.ok) {
+        uni.reLaunch({ url: "/pages/admin/index" });
+        return;
+      }
+    } catch {
+      // 非管理入口，继续普通登录流程
+    }
+  }
+  // #endif
+
   if (userStore.isLoggedIn) {
     uni.reLaunch({ url: "/pages/panel/index" });
     return;

@@ -92,11 +92,16 @@
 
                 <div class="card-actions">
                   <el-button
-                    v-if="!l.weixin_bound && (l.status === 'running' || l.status === 'created')"
+                    v-if="l.status !== 'starting'"
                     type="primary"
                     size="small"
                     @click="onBind(l.id)"
-                  >绑定微信</el-button>
+                  >{{ bindButtonLabel(l) }}</el-button>
+
+                  <el-button
+                    size="small"
+                    @click="openSkillManager(l.id, l.name)"
+                  >Skills</el-button>
 
                   <el-button
                     v-if="l.status === 'running'"
@@ -172,6 +177,105 @@
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- 绑定微信弹窗（H5） -->
+    <el-dialog
+      v-model="showBindDialog"
+      title="微信绑定向导"
+      width="860px"
+      destroy-on-close
+      append-to-body
+      @close="closeBindDialog"
+    >
+      <div class="bind-shell">
+        <div class="bind-left">
+          <div class="bind-title">扫码绑定微信</div>
+          <div class="bind-subtitle">请使用微信扫一扫，把微信账号绑定到这只龙虾</div>
+
+          <div v-if="bindQrImageSrc" class="bind-qr-card">
+            <img class="bind-qr-image" :src="bindQrImageSrc" alt="微信绑定二维码" />
+          </div>
+          <div v-else-if="!bindIsDone && !bindIsError" class="bind-qr-placeholder">
+            <el-icon class="is-loading" style="font-size: 28px; margin-bottom: 10px"><Loading /></el-icon>
+            <span>正在等待二维码...</span>
+          </div>
+
+          <div v-if="bindIsDone" class="bind-result bind-success">✅ 绑定成功，龙虾已上线</div>
+          <div v-if="bindIsError" class="bind-result bind-error">❌ {{ bindErrorMsg }}</div>
+        </div>
+
+        <div class="bind-right">
+          <div class="bind-log-title">实时进度</div>
+          <div ref="bindLogPane" class="bind-log-pane">
+            <div v-for="(line, idx) in bindLogLines" :key="idx" class="bind-log-line">{{ line }}</div>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button v-if="bindIsError" type="warning" @click="retryBind">重试绑定</el-button>
+        <el-button @click="showBindDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="showSkillDialog"
+      title="Skill 管理"
+      width="900px"
+      destroy-on-close
+    >
+      <div class="skill-dialog-header">
+        <div>
+          <div class="skill-dialog-title">{{ skillTargetName || '当前龙虾' }}</div>
+          <div class="skill-dialog-subtitle">从 Skill 库快速选择并下发到这只龙虾</div>
+        </div>
+        <el-button size="small" :loading="skillLoading" @click="loadSkillManagerData">刷新</el-button>
+      </div>
+
+      <div v-if="skillLoading" class="skill-loading-area">
+        <el-skeleton :rows="5" animated />
+      </div>
+      <div v-else class="skill-grid">
+        <div v-for="skill in skillLibrary" :key="skill.slug" class="skill-card">
+          <div class="skill-card-head">
+            <div>
+              <div class="skill-card-title">{{ skill.display_name || skill.slug }}</div>
+              <div class="skill-card-slug">{{ skill.slug }}</div>
+            </div>
+            <el-tag size="small" :type="skillInstalled(skill.slug) ? 'success' : 'info'">
+              {{ skillInstalled(skill.slug) ? '已安装' : '未安装' }}
+            </el-tag>
+          </div>
+          <div class="skill-card-summary">{{ skill.summary || '暂无摘要' }}</div>
+          <div class="skill-card-meta">
+            <span>版本 {{ skill.version || '-' }}</span>
+            <span>{{ skill.category || '未分类' }}</span>
+            <span>{{ skill.source?.type || '-' }}</span>
+          </div>
+          <div v-if="skill.requires?.bins?.length || skill.requires?.env?.length" class="skill-card-reqs">
+            <span v-for="bin in skill.requires?.bins || []" :key="`${skill.slug}-bin-${bin}`" class="skill-pill">{{ bin }}</span>
+            <span v-for="env in skill.requires?.env || []" :key="`${skill.slug}-env-${env}`" class="skill-pill skill-pill-env">{{ env }}</span>
+          </div>
+          <div class="skill-card-actions">
+            <el-button
+              v-if="!skillInstalled(skill.slug)"
+              type="primary"
+              size="small"
+              :loading="skillActionKey === `install:${skill.slug}`"
+              @click="installSkillToTarget(skill.slug)"
+            >安装到龙虾</el-button>
+            <el-button
+              v-else
+              size="small"
+              type="danger"
+              plain
+              :loading="skillActionKey === `remove:${skill.slug}`"
+              @click="uninstallSkillFromTarget(skill.slug)"
+            >移除</el-button>
+          </div>
+        </div>
+      </div>
+      <el-empty v-if="!skillLoading && skillLibrary.length === 0" description="管理员还没有上传可用的 Skill" />
+    </el-dialog>
   </div>
   <!-- #endif -->
 
@@ -244,12 +348,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onUnmounted, nextTick } from "vue";
 import { useUserStore } from "../../stores/user";
 import { useLobsterStore } from "../../stores/lobster";
 import { authApi } from "../../api/auth";
+import { getBaseUrl } from "../../api/request";
+import { lobsterApi, type SkillRegistryEntry, type LobsterSkillInfo } from "../../api/lobster";
 // #ifdef H5
-import { Plus, UserFilled } from "@element-plus/icons-vue";
+import { Loading, Plus, UserFilled } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 // #endif
 // #ifndef H5
@@ -266,6 +372,25 @@ const creating = ref(false);
 const regionOptions = ref(["🌐 自动选择最优节点"]);
 const regionIndex = ref(0);
 const regions = ref<string[]>([]);
+const showBindDialog = ref(false);
+const bindTargetId = ref("");
+const bindQrImageSrc = ref("");
+const bindLogLines = ref<string[]>([]);
+const bindIsDone = ref(false);
+const bindIsError = ref(false);
+const bindErrorMsg = ref("");
+const bindLogPane = ref<HTMLElement | null>(null);
+const showSkillDialog = ref(false);
+const skillTargetId = ref("");
+const skillTargetName = ref("");
+const skillLoading = ref(false);
+const skillActionKey = ref("");
+const skillLibrary = ref<SkillRegistryEntry[]>([]);
+const installedSkills = ref<LobsterSkillInfo[]>([]);
+
+// #ifdef H5
+let bindEventSource: EventSource | null = null;
+// #endif
 
 const regionEmojiMap: Record<string, string> = {
   华南: "☀️", 华北: "❄️", 华中: "🌤️", 华东: "🌊", 境外: "🌐",
@@ -283,6 +408,10 @@ onMounted(async () => {
   uni.showLoading({ title: "加载中..." });
   await lobsterStore.fetchAll();
   uni.hideLoading();
+});
+
+onUnmounted(() => {
+  cleanupBindStream();
 });
 
 async function onRefresh() {
@@ -327,7 +456,215 @@ async function doCreate() {
 }
 
 async function onBind(id: string) {
+  // #ifdef H5
+  bindTargetId.value = id;
+  resetBindState();
+  showBindDialog.value = true;
+  startBindFlow();
+  // #endif
+
+  // #ifndef H5
   uni.navigateTo({ url: `/pages/lobster/bind?id=${id}` });
+  // #endif
+}
+
+async function openSkillManager(id: string, name?: string) {
+  skillTargetId.value = id;
+  skillTargetName.value = name || "";
+  showSkillDialog.value = true;
+  await loadSkillManagerData();
+}
+
+async function loadSkillManagerData() {
+  if (!skillTargetId.value) return;
+  skillLoading.value = true;
+  try {
+    const [libraryRes, installedRes] = await Promise.all([
+      lobsterApi.skillLibrary(),
+      lobsterApi.listSkills(skillTargetId.value),
+    ]);
+    skillLibrary.value = libraryRes.skills || [];
+    installedSkills.value = installedRes.skills || [];
+  } catch (err: any) {
+    // #ifdef H5
+    ElMessage.error(err?.message || "加载 Skill 列表失败");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: err?.message || "加载 Skill 列表失败", icon: "error" });
+    // #endif
+  } finally {
+    skillLoading.value = false;
+  }
+}
+
+function skillInstalled(slug: string) {
+  return installedSkills.value.some((item) => item.slug === slug);
+}
+
+async function installSkillToTarget(slug: string) {
+  if (!skillTargetId.value) return;
+  skillActionKey.value = `install:${slug}`;
+  try {
+    const res = await lobsterApi.installSkill(skillTargetId.value, slug);
+    // #ifdef H5
+    ElMessage.success(res.message || "Skill 安装成功");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: res.message || "Skill 安装成功", icon: "success" });
+    // #endif
+    await loadSkillManagerData();
+  } catch (err: any) {
+    // #ifdef H5
+    ElMessage.error(err?.message || "Skill 安装失败");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: err?.message || "Skill 安装失败", icon: "error" });
+    // #endif
+  } finally {
+    skillActionKey.value = "";
+  }
+}
+
+async function uninstallSkillFromTarget(slug: string) {
+  if (!skillTargetId.value) return;
+  skillActionKey.value = `remove:${slug}`;
+  try {
+    const res = await lobsterApi.uninstallSkill(skillTargetId.value, slug);
+    // #ifdef H5
+    ElMessage.success(res.message || "Skill 已移除");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: res.message || "Skill 已移除", icon: "success" });
+    // #endif
+    await loadSkillManagerData();
+  } catch (err: any) {
+    // #ifdef H5
+    ElMessage.error(err?.message || "移除 Skill 失败");
+    // #endif
+    // #ifndef H5
+    uni.showToast({ title: err?.message || "移除 Skill 失败", icon: "error" });
+    // #endif
+  } finally {
+    skillActionKey.value = "";
+  }
+}
+
+function resetBindState() {
+  bindQrImageSrc.value = "";
+  bindLogLines.value = ["连接中..."];
+  bindIsDone.value = false;
+  bindIsError.value = false;
+  bindErrorMsg.value = "";
+}
+
+function addBindLog(message: string) {
+  if (!message) return;
+  bindLogLines.value.push(message);
+  nextTick(() => {
+    if (bindLogPane.value) {
+      bindLogPane.value.scrollTop = bindLogPane.value.scrollHeight;
+    }
+  });
+}
+
+function parseBindPayload<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function cleanupBindStream() {
+  // #ifdef H5
+  if (bindEventSource) {
+    bindEventSource.close();
+    bindEventSource = null;
+  }
+  // #endif
+}
+
+function closeBindDialog() {
+  cleanupBindStream();
+  bindTargetId.value = "";
+}
+
+function handleBindEvent(event: string, stage: string, message: string, url?: string) {
+  if (event === "qrcode" && url) {
+    const base = getBaseUrl();
+    bindQrImageSrc.value = `${base}/api/qrcode?url=${encodeURIComponent(url)}`;
+    addBindLog("二维码已生成，请用微信扫一扫");
+    return;
+  }
+
+  if (event === "done") {
+    bindIsDone.value = true;
+    addBindLog(message || "绑定完成");
+    lobsterStore.fetchAll().catch(() => {});
+    return;
+  }
+
+  if (event === "error") {
+    bindIsError.value = true;
+    bindErrorMsg.value = message || "绑定失败";
+    addBindLog(`错误: ${bindErrorMsg.value}`);
+    return;
+  }
+
+  if (message) {
+    const prefix = stage === "waiting" ? "等待扫码: " : "";
+    addBindLog(prefix + message);
+  }
+}
+
+function startBindFlow() {
+  // #ifdef H5
+  cleanupBindStream();
+  if (!bindTargetId.value) {
+    bindIsError.value = true;
+    bindErrorMsg.value = "龙虾 ID 无效";
+    return;
+  }
+  const token = userStore.token;
+  if (!token) {
+    bindIsError.value = true;
+    bindErrorMsg.value = "登录已失效，请重新登录";
+    return;
+  }
+
+  const base = getBaseUrl();
+  const sseUrl = `${base}/api/lobsters/${encodeURIComponent(bindTargetId.value)}/bind?token=${encodeURIComponent(token)}`;
+  const es = new EventSource(sseUrl);
+  bindEventSource = es;
+
+  es.addEventListener("progress", (e: MessageEvent) => {
+    const d = parseBindPayload(e.data, { stage: "", message: "" });
+    handleBindEvent("progress", d.stage, d.message);
+  });
+
+  es.addEventListener("qrcode", (e: MessageEvent) => {
+    const d = parseBindPayload(e.data, { stage: "", message: "", url: "" });
+    handleBindEvent("qrcode", d.stage, d.message, d.url);
+  });
+
+  es.addEventListener("done", (e: MessageEvent) => {
+    const d = parseBindPayload(e.data, { stage: "", message: "" });
+    handleBindEvent("done", d.stage, d.message);
+    cleanupBindStream();
+  });
+
+  es.onerror = () => {
+    if (!bindIsDone.value && !bindIsError.value) {
+      handleBindEvent("error", "error", "连接断开，请重试");
+    }
+    cleanupBindStream();
+  };
+  // #endif
+}
+
+function retryBind() {
+  resetBindState();
+  startBindFlow();
 }
 
 async function onStop(id: string) {
@@ -389,12 +726,24 @@ async function onDelete(id: string, name: string) {
 
 // ── H5 辅助函数 ──
 function statusType(status: string): "" | "success" | "warning" | "danger" | "info" {
-  const map: Record<string, any> = { running: "success", stopped: "info", error: "danger" };
+  const map: Record<string, any> = {
+    created: "info",
+    binding: "warning",
+    running: "success",
+    stopped: "info",
+    error: "danger",
+  };
   return map[status] || "info";
 }
 
 function statusLabel(s: string): string {
-  const map: Record<string, string> = { running: "运行中", stopped: "已停止", error: "异常" };
+  const map: Record<string, string> = {
+    created: "待绑定",
+    binding: "绑定中（可重试）",
+    running: "运行中",
+    stopped: "已停止",
+    error: "绑定失败",
+  };
   return map[s] || s;
 }
 
@@ -416,6 +765,11 @@ function quotaStatus(l: any): "" | "success" | "warning" | "exception" {
 function formatTime(t?: string): string {
   if (!t) return "-";
   return t.replace("T", " ").slice(0, 16);
+}
+
+function bindButtonLabel(l: any): string {
+  if (l.status === "binding" || l.status === "error") return "重试绑定";
+  return l.weixin_bound ? "微信管理" : "绑定微信";
 }
 </script>
 
@@ -532,6 +886,226 @@ function formatTime(t?: string): string {
   display: flex;
   gap: 8px;
   margin-top: 14px;
+}
+
+.bind-shell {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  min-height: 460px;
+}
+
+.bind-left {
+  border: 1px solid #ebeef5;
+  border-radius: 14px;
+  padding: 16px;
+  background: linear-gradient(160deg, #f8fbff 0%, #f5f9f2 100%);
+}
+
+.bind-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: #1f2937;
+}
+
+.bind-subtitle {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.bind-qr-card {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 286px;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+}
+
+.bind-qr-image {
+  width: 256px;
+  height: 256px;
+  object-fit: contain;
+}
+
+.bind-qr-placeholder {
+  margin-top: 16px;
+  min-height: 286px;
+  border: 1px dashed #9ca3af;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #6b7280;
+}
+
+.bind-right {
+  border: 1px solid #ebeef5;
+  border-radius: 14px;
+  padding: 12px;
+  background: #0b1220;
+  color: #d1d5db;
+}
+
+.bind-log-title {
+  font-size: 13px;
+  color: #93c5fd;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.bind-log-pane {
+  height: 420px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(2, 6, 23, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.bind-log-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  color: #e2e8f0;
+  line-height: 1.6;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+.bind-result {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.bind-success {
+  background: #ecfdf5;
+  border: 1px solid #86efac;
+  color: #166534;
+}
+
+.bind-error {
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+}
+
+.skill-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.skill-dialog-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.skill-dialog-subtitle {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.skill-loading-area {
+  padding: 12px 0;
+}
+
+.skill-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.skill-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 16px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+}
+
+.skill-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.skill-card-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.skill-card-slug {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.skill-card-summary {
+  margin-top: 12px;
+  min-height: 40px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #4b5563;
+}
+
+.skill-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.skill-card-reqs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.skill-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 12px;
+}
+
+.skill-pill-env {
+  background: #ecfeff;
+  color: #155e75;
+}
+
+.skill-card-actions {
+  margin-top: 14px;
+}
+
+@media (max-width: 900px) {
+  .bind-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .bind-log-pane {
+    height: 240px;
+  }
+
+  .skill-grid {
+    grid-template-columns: 1fr;
+  }
 }
 /* #endif */
 

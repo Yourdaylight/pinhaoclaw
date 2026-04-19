@@ -37,10 +37,9 @@
     <!-- 操作按钮 -->
     <view class="card-actions">
       <button
-        v-if="!lobster.weixin_bound"
         class="btn btn-primary"
         @click="$emit('bind', lobster.id)"
-      >绑定微信</button>
+      >{{ bindButtonText }}</button>
       <button
         v-if="lobster.status === 'running'"
         class="btn btn-gray"
@@ -85,6 +84,11 @@ const statusMap: Record<string, string> = {
   error: "异常",
 };
 const statusLabel = computed(() => statusMap[props.lobster.status] || props.lobster.status);
+
+const bindButtonText = computed(() => {
+  if (props.lobster.status === "binding" || props.lobster.status === "error") return "重试绑定";
+  return props.lobster.weixin_bound ? "微信管理" : "绑定微信";
+});
 </script>
 
 <style scoped>

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -12,12 +13,14 @@ import (
 
 // SSHClient 封装 SSH 连接，用于远程服务器操作
 type SSHClient struct {
-	Host     string // IP 或域名
-	Port     int    // SSH 端口（默认 22）
-	User     string // 用户名（默认 root）
-	KeyPath  string // 私钥路径
-	Password string // 密码（优先级低于 KeyPath）
-	Timeout  time.Duration
+	Host            string // IP 或域名
+	Port            int    // SSH 端口（默认 22）
+	User            string // 用户名（默认 root）
+	KeyPath         string // 私钥路径
+	PrivateKey      string // 私钥内容（OpenSSH PEM）
+	CertificatePath string // SSH 证书路径（可选，传给 -o CertificateFile）
+	Password        string // 密码（优先级低于 KeyPath）
+	Timeout         time.Duration
 }
 
 // SSHPayload 远程命令执行结果
@@ -65,6 +68,20 @@ func WithKeyPath(path string) SSHOpts {
 		}
 	}
 }
+func WithPrivateKey(key string) SSHOpts {
+	return func(c *SSHClient) {
+		if strings.TrimSpace(key) != "" {
+			c.PrivateKey = key
+		}
+	}
+}
+func WithCertificatePath(path string) SSHOpts {
+	return func(c *SSHClient) {
+		if strings.TrimSpace(path) != "" {
+			c.CertificatePath = path
+		}
+	}
+}
 func WithPassword(pw string) SSHOpts {
 	return func(c *SSHClient) {
 		if pw != "" {
@@ -84,15 +101,24 @@ func WithTimeout(d time.Duration) SSHOpts {
 func (c *SSHClient) Run(ctx context.Context, cmd string) (*SSHPayload, error) {
 	args := []string{
 		"-o", "StrictHostKeyChecking=no",
-		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
 		fmt.Sprintf("-p%d", c.Port),
 	}
-	if c.KeyPath != "" {
-		args = append(args, "-i", c.KeyPath)
-	} else if c.Password != "" {
+
+	authArgs, cleanup, usePassword, err := c.authArgsForSSH()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	if usePassword {
 		// sshpass 方式（需要系统安装 sshpass）
 		return c.runWithSSHPass(ctx, cmd)
+	}
+	args = append(args, authArgs...)
+	if c.usesKeyAuth() {
+		args = append(args, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes")
+	} else if c.Password != "" {
+		args = append(args, "-o", "BatchMode=yes")
 	}
 	args = append(args, fmt.Sprintf("%s@%s", c.User, c.Host), cmd)
 
@@ -104,7 +130,7 @@ func (c *SSHClient) Run(ctx context.Context, cmd string) (*SSHPayload, error) {
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 
-	err := command.Run()
+	err = command.Run()
 
 	result := &SSHPayload{
 		Stdout:   strings.TrimSpace(stdout.String()),
@@ -155,8 +181,14 @@ func (c *SSHClient) SCPUpload(ctx context.Context, localPath, remotePath string)
 	scpArgs := []string{
 		"-o", "StrictHostKeyChecking=no",
 	}
-	if c.KeyPath != "" {
-		scpArgs = append(scpArgs, "-o", "BatchMode=yes", "-i", c.KeyPath)
+	authArgs, cleanup, usePassword, err := c.authArgsForSCP()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	scpArgs = append(scpArgs, authArgs...)
+	if c.usesKeyAuth() {
+		scpArgs = append(scpArgs, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes")
 	}
 	scpArgs = append(scpArgs,
 		fmt.Sprintf("-P%d", c.Port),
@@ -168,7 +200,7 @@ func (c *SSHClient) SCPUpload(ctx context.Context, localPath, remotePath string)
 	defer cancel()
 
 	var cmd *exec.Cmd
-	if c.Password != "" && c.KeyPath == "" {
+	if usePassword {
 		// sshpass 包裹 scp
 		fullArgs := append([]string{"-p", c.Password, "scp"}, scpArgs...)
 		cmd = exec.CommandContext(runCtx, "sshpass", fullArgs...)
@@ -195,8 +227,18 @@ func (c *SSHClient) StreamRun(ctx context.Context, cmd string) (<-chan string, <
 			"-o", fmt.Sprintf("Port=%d", c.Port),
 			"-tt", // 强制分配 PTY，让远端命令输出二维码等终端内容
 		}
-		if c.KeyPath != "" {
-			sshArgs = append(sshArgs, "-o", "BatchMode=yes", "-i", c.KeyPath)
+
+		authArgs, cleanup, usePassword, err := c.authArgsForSSH()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer cleanup()
+		sshArgs = append(sshArgs, authArgs...)
+		if c.usesKeyAuth() {
+			sshArgs = append(sshArgs, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes")
+		} else if c.Password != "" {
+			sshArgs = append(sshArgs, "-o", "BatchMode=yes")
 		}
 		sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", c.User, c.Host), cmd)
 
@@ -206,7 +248,7 @@ func (c *SSHClient) StreamRun(ctx context.Context, cmd string) (<-chan string, <
 		defer cancel()
 
 		var execCmd *exec.Cmd
-		if c.Password != "" && c.KeyPath == "" {
+		if usePassword {
 			fullArgs := append([]string{"-p", c.Password, "ssh"}, sshArgs...)
 			execCmd = exec.CommandContext(runCtx, "sshpass", fullArgs...)
 		} else {
@@ -282,4 +324,84 @@ func (c *SSHClient) CheckConnection(ctx context.Context) error {
 // String 返回连接描述
 func (c *SSHClient) String() string {
 	return fmt.Sprintf("ssh://%s@%s:%d", c.User, c.Host, c.Port)
+}
+
+func (c *SSHClient) usesKeyAuth() bool {
+	return strings.TrimSpace(c.PrivateKey) != "" || strings.TrimSpace(c.KeyPath) != ""
+}
+
+func (c *SSHClient) authArgsForSSH() ([]string, func(), bool, error) {
+	if strings.TrimSpace(c.PrivateKey) != "" {
+		path, cleanup, err := writePrivateKeyTempFile(c.PrivateKey)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		args := []string{"-i", path}
+		if strings.TrimSpace(c.CertificatePath) != "" {
+			args = append(args, "-o", "CertificateFile="+c.CertificatePath)
+		}
+		return args, cleanup, false, nil
+	}
+	if strings.TrimSpace(c.KeyPath) != "" {
+		args := []string{"-i", c.KeyPath}
+		if strings.TrimSpace(c.CertificatePath) != "" {
+			args = append(args, "-o", "CertificateFile="+c.CertificatePath)
+		}
+		return args, func() {}, false, nil
+	}
+	if strings.TrimSpace(c.Password) != "" {
+		return nil, func() {}, true, nil
+	}
+	return nil, func() {}, false, nil
+}
+
+func (c *SSHClient) authArgsForSCP() ([]string, func(), bool, error) {
+	if strings.TrimSpace(c.PrivateKey) != "" {
+		path, cleanup, err := writePrivateKeyTempFile(c.PrivateKey)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return []string{"-i", path}, cleanup, false, nil
+	}
+	if strings.TrimSpace(c.KeyPath) != "" {
+		return []string{"-i", c.KeyPath}, func() {}, false, nil
+	}
+	if strings.TrimSpace(c.Password) != "" {
+		return nil, func() {}, true, nil
+	}
+	return nil, func() {}, false, nil
+}
+
+func writePrivateKeyTempFile(privateKey string) (string, func(), error) {
+	file, err := os.CreateTemp("", "pinhaoclaw-ssh-key-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create private key temp file: %w", err)
+	}
+	cleanup := func() {
+		_ = os.Remove(file.Name())
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("chmod private key temp file: %w", err)
+	}
+	content := strings.TrimSpace(privateKey)
+	if content == "" {
+		_ = file.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("private key is empty")
+	}
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	if _, err := file.WriteString(content); err != nil {
+		_ = file.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("write private key temp file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("close private key temp file: %w", err)
+	}
+	return file.Name(), cleanup, nil
 }

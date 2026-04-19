@@ -8,6 +8,11 @@ export interface Node {
   host: string;
   ssh_port: number;
   ssh_user: string;
+  ssh_auth_type?: "password" | "key_path" | "private_key";
+  ssh_key_path?: string;
+  ssh_private_key?: string;
+  ssh_certificate_path?: string;
+  ssh_key_passphrase?: string;
   ssh_password?: string;
   region: string;
   status: string;
@@ -40,6 +45,77 @@ export interface Overview {
   total_nodes: number;
 }
 
+export interface PicoclawPackageInfo {
+  configured_path: string;
+  resolved_path: string;
+  version: string;
+  managed_path: string;
+}
+
+export interface SkillRequires {
+  bins?: string[];
+  env?: string[];
+}
+
+export interface SkillSource {
+  type: string;
+  repo?: string;
+  clawhub?: string;
+  local_dir?: string;
+}
+
+export interface SkillRegistryEntry {
+  slug: string;
+  display_name: string;
+  summary: string;
+  category: string;
+  author: string;
+  version: string;
+  icon?: string;
+  tags?: string[];
+  requires?: SkillRequires;
+  source: SkillSource;
+  is_verified: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillUploadPayload {
+  slug?: string;
+  display_name?: string;
+  summary?: string;
+  category?: string;
+  author?: string;
+  version?: string;
+  icon?: string;
+  tags?: string;
+  requires_bins?: string;
+  requires_env?: string;
+  is_verified?: boolean;
+}
+
+async function uploadAdminSkillZip(file: File, payload: SkillUploadPayload) {
+  const formData = new FormData();
+  formData.append("file", file);
+  Object.entries(payload).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    formData.append(key, typeof value === "boolean" ? String(value) : value);
+  });
+
+  const res = await fetch("/api/admin/skills/upload", {
+    method: "POST",
+    headers: {
+      "X-Admin-Token": uni.getStorageSync("pc_admin_token") || "",
+    },
+    body: formData,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.message || data?.error || "上传 Skill 失败");
+  }
+  return data as { ok: boolean; skill: SkillRegistryEntry };
+}
+
 export const adminApi = {
   login: (password: string) =>
     http.post<{ ok: boolean; token: string; message?: string }>("/api/admin/login", { password }),
@@ -52,6 +128,9 @@ export const adminApi = {
 
   addNode: (node: Partial<Node>) =>
     http.post<{ ok: boolean; node: Node }>("/api/admin/nodes", node, true),
+
+  updateNode: (id: string, node: Partial<Node>) =>
+    http.put<{ ok: boolean; node: Node }>(`/api/admin/nodes/${id}`, node, true),
 
   deleteNode: (id: string) => http.del(`/api/admin/nodes/${id}`, true),
 
@@ -69,4 +148,18 @@ export const adminApi = {
 
   updateSettings: (s: Partial<Settings>) =>
     http.put<Settings>("/api/admin/settings", s, true),
+
+  picoclawPackage: () => http.get<PicoclawPackageInfo>("/api/admin/picoclaw/package", true),
+
+  setPicoclawPackage: (path: string) =>
+    http.put<{ ok: boolean; package: PicoclawPackageInfo }>("/api/admin/picoclaw/package", { path }, true),
+
+  fetchLatestPicoclawPackage: () =>
+    http.post<{ ok: boolean; package: PicoclawPackageInfo }>("/api/admin/picoclaw/package/fetch-latest", {}, true),
+
+  skills: () => http.get<{ skills: SkillRegistryEntry[] }>("/api/admin/skills", true),
+
+  deleteSkill: (slug: string) => http.del<{ ok: boolean }>(`/api/admin/skills/${slug}`, true),
+
+  uploadSkillZip: (file: File, payload: SkillUploadPayload) => uploadAdminSkillZip(file, payload),
 };

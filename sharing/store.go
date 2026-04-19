@@ -32,6 +32,10 @@ func NewStore(dataDir string) *Store {
 	return s
 }
 
+func (s *Store) Dir() string {
+	return s.dir
+}
+
 func (s *Store) path(filename string) string {
 	return filepath.Join(s.dir, filename)
 }
@@ -330,21 +334,25 @@ func (s *Store) CountLobstersByUser(userID string) int {
 // ── Node（云节点） ────────────────────────────────────
 
 type Node struct {
-	ID           string `json:"id"`
-	Type         string `json:"type,omitempty"` // ssh | local
-	Name         string `json:"name"`
-	Region       string `json:"region"` // 华南 | 华北 | 华中 | 华东 | 境外
-	Host         string `json:"host"`
-	SSHPort      int    `json:"ssh_port"`
-	SSHUser      string `json:"ssh_user"`
-	SSHKeyPath   string `json:"ssh_key_path,omitempty"`
-	SSHPassword  string `json:"ssh_password,omitempty"`
-	Status       string `json:"status"` // online | offline | deploying
-	MaxLobsters  int    `json:"max_lobsters"`
-	CurrentCount int    `json:"current_count"`
-	PicoClawPath string `json:"picoclaw_path"`
-	RemoteHome   string `json:"remote_home"`
-	CreatedAt    string `json:"created_at"`
+	ID                 string `json:"id"`
+	Type               string `json:"type,omitempty"` // ssh | local
+	Name               string `json:"name"`
+	Region             string `json:"region"` // 华南 | 华北 | 华中 | 华东 | 境外
+	Host               string `json:"host"`
+	SSHPort            int    `json:"ssh_port"`
+	SSHUser            string `json:"ssh_user"`
+	SSHAuthType        string `json:"ssh_auth_type,omitempty"` // password | key_path | private_key
+	SSHKeyPath         string `json:"ssh_key_path,omitempty"`
+	SSHPrivateKey      string `json:"ssh_private_key,omitempty"`
+	SSHCertificatePath string `json:"ssh_certificate_path,omitempty"`
+	SSHKeyPassphrase   string `json:"ssh_key_passphrase,omitempty"`
+	SSHPassword        string `json:"ssh_password,omitempty"`
+	Status             string `json:"status"` // online | offline | deploying
+	MaxLobsters        int    `json:"max_lobsters"`
+	CurrentCount       int    `json:"current_count"`
+	PicoClawPath       string `json:"picoclaw_path"`
+	RemoteHome         string `json:"remote_home"`
+	CreatedAt          string `json:"created_at"`
 }
 
 func (s *Store) ReadNodes() (map[string]*Node, error) {
@@ -352,9 +360,11 @@ func (s *Store) ReadNodes() (map[string]*Node, error) {
 	if err := s.readJSON("nodes.json", &result); err != nil {
 		return make(map[string]*Node), nil
 	}
-	// Decrypt SSH passwords on read
+	// Decrypt sensitive SSH credentials on read.
 	for _, n := range result {
 		n.SSHPassword = s.decryptField(n.SSHPassword)
+		n.SSHPrivateKey = s.decryptField(n.SSHPrivateKey)
+		n.SSHKeyPassphrase = s.decryptField(n.SSHKeyPassphrase)
 	}
 	return result, nil
 }
@@ -363,16 +373,14 @@ func (s *Store) SaveNode(n *Node) error {
 	return s.WithLock("nodes.json", func() error {
 		all := make(map[string]*Node)
 		_ = s.readFile("nodes.json", &all)
-		// Encrypt SSH password before saving
-		plainPwd := n.SSHPassword
-		n.SSHPassword = s.encryptField(plainPwd)
-		all[n.ID] = n
-		if err := s.writeFile("nodes.json", all); err != nil {
-			n.SSHPassword = plainPwd // restore on failure
-			return err
-		}
-		n.SSHPassword = plainPwd // restore in-memory plaintext after save
-		return nil
+
+		toSave := *n
+		toSave.SSHPassword = s.encryptField(toSave.SSHPassword)
+		toSave.SSHPrivateKey = s.encryptField(toSave.SSHPrivateKey)
+		toSave.SSHKeyPassphrase = s.encryptField(toSave.SSHKeyPassphrase)
+
+		all[n.ID] = &toSave
+		return s.writeFile("nodes.json", all)
 	})
 }
 
@@ -473,6 +481,7 @@ type Settings struct {
 	DefaultMonthlyTokenLimit   int64  `json:"default_monthly_token_limit"`
 	DefaultMonthlySpaceLimitMB int64  `json:"default_monthly_space_limit_mb"`
 	DefaultMaxLobstersPerUser  int    `json:"default_max_lobsters_per_user"`
+	PicoclawPackagePath        string `json:"picoclaw_package_path,omitempty"`
 	AdminPassword              string `json:"-"`
 }
 

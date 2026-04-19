@@ -138,6 +138,7 @@ func (a *App) setupRouter() {
 	admin.GET("/lobsters", a.handleAdminLobsters)
 	admin.GET("/nodes", a.handleListNodes)
 	admin.POST("/nodes", a.handleAddNode)
+	admin.PUT("/nodes/:id", a.handleUpdateNode)
 	admin.DELETE("/nodes/:id", a.handleDeleteNode)
 	admin.POST("/nodes/:id/deploy", a.handleDeployNode)
 	admin.POST("/nodes/:id/test", a.handleTestNode)
@@ -146,10 +147,14 @@ func (a *App) setupRouter() {
 	admin.DELETE("/invites/:code", a.handleDeleteInvite)
 	admin.GET("/settings", a.handleGetSettings)
 	admin.PUT("/settings", a.handleUpdateSettings)
+	admin.GET("/picoclaw/package", a.handleGetPicoclawPackage)
+	admin.PUT("/picoclaw/package", a.handleSetPicoclawPackage)
+	admin.POST("/picoclaw/package/fetch-latest", a.handleFetchLatestPicoclawPackage)
 
 	// ── 管理员 Skill 库管理 ──
 	admin.GET("/skills", a.handleAdminListSkills)
 	admin.POST("/skills", a.handleAdminCreateSkill)
+	admin.POST("/skills/upload", a.handleAdminUploadSkill)
 	admin.PUT("/skills/:slug", a.handleAdminUpdateSkill)
 	admin.DELETE("/skills/:slug", a.handleAdminDeleteSkill)
 
@@ -508,6 +513,7 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 
 	var qrSent bool
 	var loginSuccess bool
+	var unsupportedWeixinCommand bool
 
 	for line := range outCh {
 		cleanLine := stripAnsi(strings.TrimSpace(line))
@@ -536,11 +542,12 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 			}
 		}
 
-		// 检测登录成功
-		if strings.Contains(cleanLine, "Login successful") || strings.Contains(cleanLine, "successfully") ||
-			strings.Contains(cleanLine, "Saved") || strings.Contains(cleanLine, "saved") ||
-			strings.Contains(cleanLine, "✓") || strings.Contains(cleanLine, "成功") {
+		// 仅在明确的绑定成功语句出现时置为成功，避免把“配置保存成功”误判成绑定成功。
+		if isWeixinBindSuccessLine(cleanLine) {
 			loginSuccess = true
+		}
+		if strings.Contains(strings.ToLower(cleanLine), "does not support auth weixin") {
+			unsupportedWeixinCommand = true
 		}
 
 		// 过滤掉 logo 和二维码字符画，把有意义的进度推给前端
@@ -554,15 +561,21 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 	select {
 	case err := <-errCh:
 		if err != nil && !loginSuccess {
-			writeSSE("error", "error", "微信绑定失败: "+err.Error())
+			if unsupportedWeixinCommand {
+				writeSSE("error", "error", "当前节点的 picoclaw 不支持微信二维码绑定，请先升级该节点的 picoclaw")
+			} else {
+				writeSSE("error", "error", "微信绑定失败: "+err.Error())
+			}
 			l.Status = "error"
+			l.WeixinBound = false
+			l.BoundAt = ""
 			a.store.SaveLobster(l)
 			return
 		}
 	default:
 	}
 
-	if loginSuccess {
+	if loginSuccess && qrSent {
 		l.Status = "running"
 		l.WeixinBound = true
 		l.BoundAt = time.Now().Format("2006-01-02 15:04:05")
@@ -574,8 +587,16 @@ func (a *App) handleBindWeixin(c *gin.Context) {
 
 		writeSSEData("done", `{"stage":"done","message":"微信绑定成功！龙虾已上线 🦞"}`)
 	} else {
-		writeSSE("error", "error", "未检测到登录成功，请重试")
+		if unsupportedWeixinCommand {
+			writeSSE("error", "error", "当前节点的 picoclaw 不支持微信二维码绑定，请先升级该节点的 picoclaw")
+		} else if !qrSent {
+			writeSSE("error", "error", "未检测到二维码，请重试绑定")
+		} else {
+			writeSSE("error", "error", "未检测到登录成功，请重试")
+		}
 		l.Status = "error"
+		l.WeixinBound = false
+		l.BoundAt = ""
 		a.store.SaveLobster(l)
 	}
 }
@@ -711,7 +732,7 @@ func (a *App) handleListNodes(c *gin.Context) {
 	all, _ := a.store.ReadNodes()
 	list := make([]*sharing.Node, 0, len(all))
 	for _, n := range all {
-		list = append(list, n)
+		list = append(list, sanitizeNodeForResponse(n))
 	}
 	c.JSON(200, list)
 }
@@ -736,16 +757,54 @@ func (a *App) handleAddNode(c *gin.Context) {
 		}
 		req.SSHPort = 0
 		req.SSHUser = ""
+		req.SSHAuthType = ""
 		req.SSHPassword = ""
+		req.SSHKeyPath = ""
+		req.SSHPrivateKey = ""
+		req.SSHCertificatePath = ""
+		req.SSHKeyPassphrase = ""
 		if strings.TrimSpace(req.RemoteHome) == "" {
 			req.RemoteHome = filepath.Join(a.cfg.ShareClawHome, "local-nodes", req.ID)
 		}
 	} else {
+		req.Host = strings.TrimSpace(req.Host)
+		req.SSHUser = strings.TrimSpace(req.SSHUser)
+		req.SSHKeyPath = strings.TrimSpace(req.SSHKeyPath)
+		req.SSHPrivateKey = strings.TrimSpace(req.SSHPrivateKey)
+		req.SSHCertificatePath = strings.TrimSpace(req.SSHCertificatePath)
+		req.SSHKeyPassphrase = strings.TrimSpace(req.SSHKeyPassphrase)
+		req.SSHPassword = strings.TrimSpace(req.SSHPassword)
+
+		if req.Host == "" {
+			c.JSON(400, gin.H{"ok": false, "message": "SSH 节点地址不能为空"})
+			return
+		}
 		if req.SSHPort <= 0 {
 			req.SSHPort = 22
 		}
 		if req.SSHUser == "" {
 			req.SSHUser = "root"
+		}
+		credCount := 0
+		if req.SSHPassword != "" {
+			credCount++
+			req.SSHAuthType = "password"
+		}
+		if req.SSHKeyPath != "" {
+			credCount++
+			req.SSHAuthType = "key_path"
+		}
+		if req.SSHPrivateKey != "" {
+			credCount++
+			req.SSHAuthType = "private_key"
+		}
+		if credCount == 0 {
+			c.JSON(400, gin.H{"ok": false, "message": "请配置 SSH 认证信息（密码、私钥路径或私钥内容）"})
+			return
+		}
+		if credCount > 1 {
+			c.JSON(400, gin.H{"ok": false, "message": "SSH 认证信息冲突，请仅保留一种认证方式"})
+			return
 		}
 		if req.RemoteHome == "" {
 			req.RemoteHome = "/opt/pinhaoclaw"
@@ -758,7 +817,174 @@ func (a *App) handleAddNode(c *gin.Context) {
 		req.Region = "未设置"
 	}
 	a.store.SaveNode(&req)
-	c.JSON(201, gin.H{"ok": true, "node": req})
+	c.JSON(201, gin.H{"ok": true, "node": sanitizeNodeForResponse(&req)})
+}
+
+func (a *App) handleUpdateNode(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(400, gin.H{"ok": false, "message": "节点 ID 不能为空"})
+		return
+	}
+
+	existing := a.store.GetNode(id)
+	if existing == nil {
+		c.JSON(404, gin.H{"ok": false, "message": "节点不存在"})
+		return
+	}
+
+	var req sharing.Node
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"ok": false, "message": "无效的 JSON"})
+		return
+	}
+
+	updated := *existing
+
+	if strings.TrimSpace(req.Type) != "" {
+		updated.Type = strings.TrimSpace(req.Type)
+	}
+	if strings.TrimSpace(req.Name) != "" {
+		updated.Name = strings.TrimSpace(req.Name)
+	}
+	if strings.TrimSpace(req.Host) != "" {
+		updated.Host = strings.TrimSpace(req.Host)
+	}
+	if strings.TrimSpace(req.Region) != "" {
+		updated.Region = strings.TrimSpace(req.Region)
+	}
+	if strings.TrimSpace(req.RemoteHome) != "" {
+		updated.RemoteHome = strings.TrimSpace(req.RemoteHome)
+	}
+	if req.SSHPort > 0 {
+		updated.SSHPort = req.SSHPort
+	}
+	if strings.TrimSpace(req.SSHUser) != "" {
+		updated.SSHUser = strings.TrimSpace(req.SSHUser)
+	}
+	if req.MaxLobsters > 0 {
+		updated.MaxLobsters = req.MaxLobsters
+	}
+
+	if updated.Type == "local" {
+		if strings.TrimSpace(updated.Host) == "" {
+			updated.Host = "local"
+		}
+		updated.SSHPort = 0
+		updated.SSHUser = ""
+		updated.SSHAuthType = ""
+		updated.SSHPassword = ""
+		updated.SSHKeyPath = ""
+		updated.SSHPrivateKey = ""
+		updated.SSHCertificatePath = ""
+		updated.SSHKeyPassphrase = ""
+		if strings.TrimSpace(updated.RemoteHome) == "" {
+			updated.RemoteHome = filepath.Join(a.cfg.ShareClawHome, "local-nodes", updated.ID)
+		}
+	} else {
+		updated.Host = strings.TrimSpace(updated.Host)
+		updated.SSHUser = strings.TrimSpace(updated.SSHUser)
+		updated.SSHKeyPath = strings.TrimSpace(updated.SSHKeyPath)
+		updated.SSHPrivateKey = strings.TrimSpace(updated.SSHPrivateKey)
+		updated.SSHCertificatePath = strings.TrimSpace(updated.SSHCertificatePath)
+		updated.SSHKeyPassphrase = strings.TrimSpace(updated.SSHKeyPassphrase)
+		updated.SSHPassword = strings.TrimSpace(updated.SSHPassword)
+
+		if updated.Host == "" {
+			c.JSON(400, gin.H{"ok": false, "message": "SSH 节点地址不能为空"})
+			return
+		}
+		if updated.SSHPort <= 0 {
+			updated.SSHPort = 22
+		}
+		if updated.SSHUser == "" {
+			updated.SSHUser = "root"
+		}
+
+		incomingPassword := strings.TrimSpace(req.SSHPassword)
+		incomingKeyPath := strings.TrimSpace(req.SSHKeyPath)
+		incomingPrivateKey := strings.TrimSpace(req.SSHPrivateKey)
+		incomingCertPath := strings.TrimSpace(req.SSHCertificatePath)
+		incomingPassphrase := strings.TrimSpace(req.SSHKeyPassphrase)
+
+		incomingCredCount := countSSHCredentialKinds(incomingPassword, incomingKeyPath, incomingPrivateKey)
+		if incomingCredCount > 1 {
+			c.JSON(400, gin.H{"ok": false, "message": "SSH 认证信息冲突，请仅保留一种认证方式"})
+			return
+		}
+
+		if incomingCredCount == 1 {
+			updated.SSHPassword = ""
+			updated.SSHKeyPath = ""
+			updated.SSHPrivateKey = ""
+			updated.SSHCertificatePath = ""
+			updated.SSHKeyPassphrase = ""
+
+			switch {
+			case incomingPassword != "":
+				updated.SSHAuthType = "password"
+				updated.SSHPassword = incomingPassword
+			case incomingKeyPath != "":
+				updated.SSHAuthType = "key_path"
+				updated.SSHKeyPath = incomingKeyPath
+				updated.SSHCertificatePath = incomingCertPath
+			case incomingPrivateKey != "":
+				updated.SSHAuthType = "private_key"
+				updated.SSHPrivateKey = incomingPrivateKey
+				updated.SSHCertificatePath = incomingCertPath
+				updated.SSHKeyPassphrase = incomingPassphrase
+			}
+		}
+
+		if !hasAnySSHCredential(&updated) {
+			c.JSON(400, gin.H{"ok": false, "message": "请配置 SSH 认证信息（密码、私钥路径或私钥内容）"})
+			return
+		}
+	}
+
+	if updated.MaxLobsters <= 0 {
+		updated.MaxLobsters = 10
+	}
+	if updated.Region == "" {
+		updated.Region = "未设置"
+	}
+
+	a.store.SaveNode(&updated)
+	c.JSON(200, gin.H{"ok": true, "node": sanitizeNodeForResponse(&updated)})
+}
+
+func sanitizeNodeForResponse(node *sharing.Node) *sharing.Node {
+	if node == nil {
+		return nil
+	}
+	copy := *node
+	copy.SSHPassword = ""
+	copy.SSHPrivateKey = ""
+	copy.SSHKeyPassphrase = ""
+	return &copy
+}
+
+func countSSHCredentialKinds(password, keyPath, privateKey string) int {
+	count := 0
+	if password != "" {
+		count++
+	}
+	if keyPath != "" {
+		count++
+	}
+	if privateKey != "" {
+		count++
+	}
+	return count
+}
+
+func hasAnySSHCredential(node *sharing.Node) bool {
+	if node == nil {
+		return false
+	}
+	return strings.TrimSpace(node.SSHPassword) != "" ||
+		strings.TrimSpace(node.SSHKeyPath) != "" ||
+		strings.TrimSpace(node.SSHPrivateKey) != ""
 }
 
 func (a *App) handleDeleteNode(c *gin.Context) {
@@ -882,8 +1108,44 @@ func (a *App) handleUpdateSettings(c *gin.Context) {
 			s.DefaultMaxLobstersPerUser = int(f)
 		}
 	}
+	if v, ok := updates["picoclaw_package_path"]; ok {
+		if str, ok := v.(string); ok {
+			s.PicoclawPackagePath = strings.TrimSpace(str)
+		}
+	}
 	a.store.WriteSettings(s)
 	c.JSON(200, s)
+}
+
+func (a *App) handleGetPicoclawPackage(c *gin.Context) {
+	c.JSON(200, a.nodeSvc.GetPicoclawPackageInfo())
+}
+
+func (a *App) handleSetPicoclawPackage(c *gin.Context) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "无效的请求"})
+		return
+	}
+	info, err := a.nodeSvc.SetPicoclawPackagePath(req.Path)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "package": info})
+}
+
+func (a *App) handleFetchLatestPicoclawPackage(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+	info, err := a.nodeSvc.DownloadLatestOfficialPicoclaw(ctx)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "拉取官方最新失败: " + err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "package": info})
 }
 
 // ── Skill 库 Handler（用户浏览） ──────────────────────
@@ -1082,6 +1344,33 @@ func (a *App) handleAdminUpdateSkill(c *gin.Context) {
 		return
 	}
 	updates.Slug = slug
+	if updates.DisplayName == "" {
+		updates.DisplayName = existing.DisplayName
+	}
+	if updates.Summary == "" {
+		updates.Summary = existing.Summary
+	}
+	if updates.Category == "" {
+		updates.Category = existing.Category
+	}
+	if updates.Author == "" {
+		updates.Author = existing.Author
+	}
+	if updates.Version == "" {
+		updates.Version = existing.Version
+	}
+	if updates.Icon == "" {
+		updates.Icon = existing.Icon
+	}
+	if len(updates.Tags) == 0 {
+		updates.Tags = existing.Tags
+	}
+	if updates.Requires == nil {
+		updates.Requires = existing.Requires
+	}
+	if updates.Source.Type == "" {
+		updates.Source = existing.Source
+	}
 	updates.CreatedAt = existing.CreatedAt
 	updates.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.store.SaveSkillRegistryEntry(&updates)
@@ -1090,6 +1379,9 @@ func (a *App) handleAdminUpdateSkill(c *gin.Context) {
 
 func (a *App) handleAdminDeleteSkill(c *gin.Context) {
 	slug := c.Param("slug")
+	if existing := a.store.GetSkillRegistryEntry(slug); existing != nil {
+		_ = a.removeManagedSkillAssets(existing)
+	}
 	a.store.DeleteSkillRegistryEntry(slug)
 	c.JSON(200, gin.H{"ok": true})
 }
@@ -1127,6 +1419,25 @@ func stripAnsi(s string) string {
 		result.WriteRune(r)
 	}
 	return result.String()
+}
+
+func isWeixinBindSuccessLine(line string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(line))
+	if normalized == "" {
+		return false
+	}
+	markers := []string{
+		"login successful",
+		"微信绑定成功",
+		"weixin login successful",
+		"✅ login successful",
+	}
+	for _, marker := range markers {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldBlockFrontendFallback(requestPath string) bool {

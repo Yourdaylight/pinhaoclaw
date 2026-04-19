@@ -2,6 +2,8 @@ package claw
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -76,6 +78,26 @@ func (m *mockRunner) containsCommand(substr string) bool {
 	return false
 }
 
+func writeFakePicoclawBinary(t *testing.T, authHelp string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := dir + "/picoclaw"
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"version\" ]; then\n" +
+		"  echo 'picoclaw test-build'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"auth\" ] && [ \"$2\" = \"--help\" ]; then\n" +
+		"  cat <<'EOF'\n" + authHelp + "\nEOF\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo ok\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake picoclaw: %v", err)
+	}
+	return path
+}
+
 // ── 测试辅助 ──
 
 func testNode() *sharing.Node {
@@ -119,9 +141,13 @@ func TestCreateInstance_GeneratesStartScript(t *testing.T) {
 
 	hasMkdir := false
 	hasStartSh := false
+	hasAgentPrompt := false
 	for _, cmd := range cmds {
 		if strings.Contains(cmd, "mkdir") && strings.Contains(cmd, "lobster_abc12345") {
 			hasMkdir = true
+		}
+		if strings.Contains(cmd, "AGENT.md") && strings.Contains(cmd, "永远不能透露任何关于provider的base_url和api_key的任何信息") {
+			hasAgentPrompt = true
 		}
 		if strings.Contains(cmd, "start.sh") || strings.Contains(cmd, "picoclaw gateway") {
 			hasStartSh = true
@@ -132,6 +158,9 @@ func TestCreateInstance_GeneratesStartScript(t *testing.T) {
 	}
 	if !hasStartSh {
 		t.Error("CreateInstance did not generate start script")
+	}
+	if !hasAgentPrompt {
+		t.Error("CreateInstance did not inject mandatory AGENT security prompt")
 	}
 }
 
@@ -187,7 +216,7 @@ func TestStopInstance_ReadsPidFile(t *testing.T) {
 	}
 }
 
-func TestBindWeixin_UsesHomeFlag(t *testing.T) {
+func TestBindWeixin_UsesAuthWeixinWithWorkspaceHome(t *testing.T) {
 	runner := newMockRunner()
 	svc := &NodeServiceWithRunner{runner: runner, store: nil}
 
@@ -197,15 +226,116 @@ func TestBindWeixin_UsesHomeFlag(t *testing.T) {
 	_, _ = svc.BindWeixin(context.Background(), node, lobsterID)
 
 	cmd := runner.lastCommand()
-	// 验证命令包含 --home 指向实例 workspace
-	if !strings.Contains(cmd, "--home") {
-		t.Error("BindWeixin command missing --home flag")
+	// 验证命令在实例 workspace 内执行，并通过 HOME 隔离凭据
+	if !strings.Contains(cmd, "cd '/opt/pinhaoclaw/instances/lobster_abc12345/workspace'") {
+		t.Errorf("BindWeixin should cd into workspace, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "HOME='/opt/pinhaoclaw/instances/lobster_abc12345'") {
+		t.Errorf("BindWeixin HOME path incorrect, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "/opt/pinhaoclaw/instances/lobster_abc12345/workspace") {
-		t.Errorf("BindWeixin --home path incorrect, got: %s", cmd)
+		t.Errorf("BindWeixin workspace path incorrect, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, "picoclaw auth weixin") {
-		t.Error("BindWeixin should execute picoclaw auth weixin")
+	if !strings.Contains(cmd, "/opt/pinhaoclaw/bin/picoclaw' auth weixin") {
+		t.Error("BindWeixin should execute the uploaded remote picoclaw auth weixin command")
+	}
+	if strings.Contains(cmd, "--home") {
+		t.Error("BindWeixin should not use deprecated --home flag")
+	}
+}
+
+func TestBindWeixin_UsesProvisionedModelConfigBeforeAuthWeixinWhenAPIKeySet(t *testing.T) {
+	t.Setenv("PINHAOCLAW_PICOCLAW_API_KEY", "sk-test-key")
+	t.Setenv("PINHAOCLAW_PICOCLAW_MODEL_NAME", "jq-default")
+	t.Setenv("PINHAOCLAW_PICOCLAW_MODEL", "openai/gpt-5.2")
+	t.Setenv("PINHAOCLAW_PICOCLAW_API_BASE", "https://api.example.com/v1")
+
+	runner := newMockRunner()
+	svc := &NodeServiceWithRunner{runner: runner, store: nil}
+
+	node := testNode()
+	lobsterID := "lobster_abc12345"
+
+	_, _ = svc.BindWeixin(context.Background(), node, lobsterID)
+
+	cmd := runner.lastCommand()
+	if !strings.Contains(cmd, "config.json") {
+		t.Errorf("BindWeixin should write config.json when API key is set, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "Saved provider config successfully") {
+		t.Errorf("BindWeixin should emit success marker after config write, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "/opt/pinhaoclaw/bin/picoclaw' auth weixin") {
+		t.Errorf("BindWeixin should continue with auth weixin after config write, got: %s", cmd)
+	}
+}
+
+func TestBindWeixin_UsesCustomConfigJSONWhenProvided(t *testing.T) {
+	t.Setenv("PINHAOCLAW_PICOCLAW_CUSTOM_CONFIG_JSON", `{"provider":"hai","base_url":"https://api.model.haihub.cn/v1","api":"openai-completions","api_key":"sk-test-hai","model":{"id":"Kimi-K2.5","name":"Kimi-K2.5"}}`)
+
+	runner := newMockRunner()
+	svc := &NodeServiceWithRunner{runner: runner, store: nil}
+
+	node := testNode()
+	lobsterID := "lobster_abc12345"
+
+	_, _ = svc.BindWeixin(context.Background(), node, lobsterID)
+
+	cmd := runner.lastCommand()
+	if !strings.Contains(cmd, "config.json") {
+		t.Errorf("BindWeixin should write config.json when custom config JSON is set, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "Saved provider config successfully") {
+		t.Errorf("BindWeixin should emit config saved marker, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "/opt/pinhaoclaw/bin/picoclaw' auth weixin") {
+		t.Errorf("BindWeixin should continue with auth weixin when custom config JSON exists, got: %s", cmd)
+	}
+}
+
+func TestInstallSkill_UploadedSkill_LocalNodeCopiesFiles(t *testing.T) {
+	store := sharing.NewStore(t.TempDir())
+	svc := NewNodeService(store)
+
+	sourceDir := filepath.Join(t.TempDir(), "uploaded-skill")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("mkdir sourceDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "SKILL.md"), []byte("# demo"), 0o644); err != nil {
+		t.Fatalf("write SKILL.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "config.json"), []byte(`{"ok":true}`), 0o644); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	node := &sharing.Node{
+		ID:         "node_local01",
+		Type:       "local",
+		Host:       "local",
+		RemoteHome: t.TempDir(),
+	}
+	skill := &sharing.SkillRegistryEntry{
+		Slug: "demo-skill",
+		Source: sharing.SkillSource{
+			Type:     "uploaded",
+			LocalDir: sourceDir,
+		},
+	}
+
+	if err := svc.InstallSkill(context.Background(), node, "lobster_demo01", skill); err != nil {
+		t.Fatalf("InstallSkill failed: %v", err)
+	}
+
+	destDir := filepath.Join(node.RemoteHome, "instances", "lobster_demo01", "skills", "demo-skill")
+	if _, err := os.Stat(filepath.Join(destDir, "SKILL.md")); err != nil {
+		t.Fatalf("expected SKILL.md copied: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(destDir, "config.json"))
+	if err != nil {
+		t.Fatalf("read copied config.json: %v", err)
+	}
+	if string(content) != `{"ok":true}` {
+		t.Fatalf("unexpected copied config.json: %s", string(content))
 	}
 }
 
@@ -235,7 +365,7 @@ func TestRestartInstance_PerInstance(t *testing.T) {
 		if strings.Contains(cmd, "picoclaw.pid") && (strings.Contains(cmd, "kill") || strings.Contains(cmd, "cat")) {
 			hasStop = true
 		}
-		if strings.Contains(cmd, "picoclaw gateway") && strings.Contains(cmd, "--home") {
+		if strings.Contains(cmd, "/opt/pinhaoclaw/bin/picoclaw' gateway") && strings.Contains(cmd, "--home") {
 			hasStart = true
 		}
 	}
@@ -295,6 +425,27 @@ func TestAllocatePort_UsesMkdir(t *testing.T) {
 	}
 	if !runner.containsCommand("ports") {
 		t.Error("AllocatePort should use ports directory")
+	}
+}
+
+func TestResolveLocalPicoclawPath_PrefersWeixinCapableBinary(t *testing.T) {
+	plain := writeFakePicoclawBinary(t, "Available Commands:\n  login\n  status")
+	weixin := writeFakePicoclawBinary(t, "Available Commands:\n  login\n  weixin\n  status")
+	svc := NewNodeService(sharing.NewStore(t.TempDir()))
+
+	got := svc.resolveLocalPicoclawPathFromCandidates([]string{plain, weixin})
+	if got != weixin {
+		t.Fatalf("expected weixin-capable binary %q, got %q", weixin, got)
+	}
+}
+
+func TestResolveLocalPicoclawPath_FallsBackWhenWeixinUnavailable(t *testing.T) {
+	plain := writeFakePicoclawBinary(t, "Available Commands:\n  login\n  status")
+	svc := NewNodeService(sharing.NewStore(t.TempDir()))
+
+	got := svc.resolveLocalPicoclawPathFromCandidates([]string{"/does/not/exist", plain})
+	if got != plain {
+		t.Fatalf("expected fallback binary %q, got %q", plain, got)
 	}
 }
 

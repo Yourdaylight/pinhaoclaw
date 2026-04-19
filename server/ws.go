@@ -81,6 +81,7 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 	outCh, errCh := a.nodeSvc.BindWeixin(ctx, node, lobsterID)
 
 	var qrSent, loginSuccess bool
+	var unsupportedWeixinCommand bool
 
 	for line := range outCh {
 		cleanLine := stripAnsi(strings.TrimSpace(line))
@@ -105,10 +106,11 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 			}
 		}
 
-		if strings.Contains(cleanLine, "Login successful") || strings.Contains(cleanLine, "successfully") ||
-			strings.Contains(cleanLine, "Saved") || strings.Contains(cleanLine, "saved") ||
-			strings.Contains(cleanLine, "✓") || strings.Contains(cleanLine, "成功") {
+		if isWeixinBindSuccessLine(cleanLine) {
 			loginSuccess = true
+		}
+		if strings.Contains(strings.ToLower(cleanLine), "does not support auth weixin") {
+			unsupportedWeixinCommand = true
 		}
 
 		if !strings.ContainsAny(cleanLine, "█▄▀▐▌") &&
@@ -121,15 +123,21 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 	select {
 	case err := <-errCh:
 		if err != nil && !loginSuccess {
-			send("error", "error", "微信绑定失败: "+err.Error())
+			if unsupportedWeixinCommand {
+				send("error", "error", "当前节点的 picoclaw 不支持微信二维码绑定，请先升级该节点的 picoclaw")
+			} else {
+				send("error", "error", "微信绑定失败: "+err.Error())
+			}
 			l.Status = "error"
+			l.WeixinBound = false
+			l.BoundAt = ""
 			a.store.SaveLobster(l)
 			return
 		}
 	default:
 	}
 
-	if loginSuccess {
+	if loginSuccess && qrSent {
 		l.Status = "running"
 		l.WeixinBound = true
 		l.BoundAt = fmt.Sprintf("%s", time.Now().Format("2006-01-02 15:04:05"))
@@ -143,8 +151,16 @@ func (a *App) handleBindWeixinWS(c *gin.Context) {
 			"message": "微信绑定成功！龙虾已上线 🦞",
 		})
 	} else {
-		send("error", "error", "未检测到登录成功，请重试")
+		if unsupportedWeixinCommand {
+			send("error", "error", "当前节点的 picoclaw 不支持微信二维码绑定，请先升级该节点的 picoclaw")
+		} else if !qrSent {
+			send("error", "error", "未检测到二维码，请重试绑定")
+		} else {
+			send("error", "error", "未检测到登录成功，请重试")
+		}
 		l.Status = "error"
+		l.WeixinBound = false
+		l.BoundAt = ""
 		a.store.SaveLobster(l)
 	}
 }
